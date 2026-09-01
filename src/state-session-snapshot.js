@@ -363,6 +363,11 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     agentId,
     agentName: resolveAgentDisplayName(agentId),
     iconUrl: getAgentIconUrl(agentId),
+    // Normalized tool identity only; never expose raw tool input on shared
+    // snapshot surfaces. Presentation consumers use it to refine `working`.
+    toolName: (session && typeof session.lastToolName === "string")
+      ? session.lastToolName
+      : null,
     state,
     startupRecovered,
     badge,
@@ -610,6 +615,7 @@ function sessionSnapshotSignature(snapshot) {
       cwd: entry.cwd,
       agentId: entry.agentId,
       agentName: entry.agentName,
+      toolName: entry.toolName,
       sourcePid: entry.sourcePid,
       wtHwnd: entry.wtHwnd,
       canFocus: entry.canFocus,

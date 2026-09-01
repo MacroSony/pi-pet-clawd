@@ -181,6 +181,7 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const createPetPresentationBridge = require("./pet-presentation-bridge");
 const { collectRequiredAssetFiles } = require("./theme-schema");
 const { describeGeometrySync } = require("./pet-accessory-state");
 const { createDisplayedVisualProjection } = require("./displayed-visual-projection");
@@ -2120,6 +2121,17 @@ let sendDashboardI18n = () => {};
 // after the updater module is constructed below.
 let notifyUpdaterSilentExit = () => {};
 
+// Opt-in adapter for a renderer that needs one independent pet per session.
+// Clawd's own renderer stays unchanged (one aggregate pet); this consumer gets
+// the same authoritative snapshot fan-out as Dashboard/HUD/notifications.
+const petPresentationBridge = createPetPresentationBridge({
+  enabled: createPetPresentationBridge.isEnabledFromEnv(process.env),
+  statusDir: process.env.CLAWD_PET_BRIDGE_STATUS_DIR,
+  rendererBinary: process.env.CLAWD_PET_BRIDGE_RENDERER_BIN,
+  assetsDir: process.env.CLAWD_PET_BRIDGE_ASSETS_DIR,
+  log: (message) => sessionLog(`[pet-bridge] ${message}`),
+});
+
 // #509: user-selected default idle visual, resolved against the live active
 // theme so reads never go stale across theme switches. Returns null when
 // unset/invalid — callers keep their existing fallback. The visible repaint
@@ -2240,6 +2252,9 @@ const _stateCtx = {
     reconcilePowerSaveBlocker();
     broadcastDashboardSessionSnapshot(snapshot);
     broadcastSessionHudSnapshot(snapshot);
+    try { petPresentationBridge.onSnapshot(snapshot); } catch (error) {
+      sessionLog(`[pet-bridge] snapshot projection failed: ${error && error.message}`);
+    }
     repositionFloatingBubbles();
     // R1a: best-effort completion notifications. Must never throw or block the
     // broadcast — the companion computes synchronously and fires sends async.
