@@ -85,6 +85,13 @@ function resolveRemoteRuntimeLayout({ runtimeMode, runtimeKey, remoteHome } = {}
     codexHome,
     codexSessionsDir: path.posix.join(codexHome, "sessions"),
     copilotHome,
+    // Pi extensions are account-global rather than profile-isolated. The
+    // deployer exposes their paths for ownership/verification, but only
+    // account-default deploys are allowed to mutate them.
+    piAgentDir: path.posix.join(remoteHome, ".pi", "agent"),
+    piExtensionDir: path.posix.join(remoteHome, ".pi", "agent", "extensions", "clawd-on-desk"),
+    piExtensionMarkerFile: path.posix.join(remoteHome, ".pi", "agent", "extensions", "clawd-on-desk", ".clawd-managed.json"),
+    piRemoteIdentityFile: path.posix.join(remoteHome, ".pi", "agent", "extensions", "clawd-on-desk", "clawd-remote.json"),
     clawdStateDir,
     binDir,
     wrapperEvidenceDir,

@@ -82,6 +82,10 @@ const HOOK_FILES = [
   "codex-subagent-fields.js",
   "copilot-hook.js",
   "copilot-install.js",
+  // Pi's extension is installed from this staged, hash-verified source set.
+  "pi-extension.ts",
+  "pi-extension-core.js",
+  "pi-install.js",
 ];
 const ISOLATED_CLI_MINIMUMS = Object.freeze({
   // Claude has a reviewed baseline in plan v8. Codex/Copilot stay fail-closed
@@ -646,6 +650,7 @@ function buildOwnershipPreflightScript({ profile, layout, installId }) {
     layout.hostPrefixFile,
     layout.monitorPidFile,
     ...(layout.legacyMonitorPidFile ? [layout.legacyMonitorPidFile] : []),
+    ...(layout.runtimeMode === "account-default" ? [layout.piExtensionMarkerFile] : []),
     path.posix.join(layout.claudeHooksDir, "server-config.js"),
   ];
   const configTracePaths = [
@@ -665,6 +670,7 @@ function buildOwnershipPreflightScript({ profile, layout, installId }) {
     "const fs=require('fs');",
     `const identityPath=${JSON.stringify(layout.identityFile)};`,
     `const runtimePath=${JSON.stringify(path.posix.join(layout.clawdStateDir, "runtime.json"))};`,
+    `const piMarkerPath=${JSON.stringify(layout.runtimeMode === "account-default" ? layout.piExtensionMarkerFile : null)};`,
     `const expected=${JSON.stringify(expected)};`,
     `const tracePaths=${JSON.stringify(tracePaths)};`,
     `const configTracePaths=${JSON.stringify(configTracePaths)};`,
@@ -675,6 +681,8 @@ function buildOwnershipPreflightScript({ profile, layout, installId }) {
     "let identity=null;",
     "try{identity=JSON.parse(fs.readFileSync(identityPath,'utf8'))}catch(e){if(e&&e.code!=='ENOENT'){console.log(JSON.stringify({ok:false,reason:'identity_invalid'}));process.exit(82)}}",
     "if(identity){for(const k of Object.keys(expected)){if(identity[k]!==expected[k]){console.log(JSON.stringify({ok:false,reason:'ownership_conflict',field:k}));process.exit(83)}}}",
+    "let piMarker=null;try{if(piMarkerPath)piMarker=JSON.parse(fs.readFileSync(piMarkerPath,'utf8'))}catch(e){if(e&&e.code!=='ENOENT'){console.log(JSON.stringify({ok:false,reason:'pi_marker_invalid'}));process.exit(82)}}",
+    "if(piMarker&&piMarker.remote){for(const k of Object.keys(expected)){if(piMarker.remote[k]!==expected[k]){console.log(JSON.stringify({ok:false,reason:'ownership_conflict',field:'pi.'+k}));process.exit(83)}}}",
     "const traces=tracePaths.filter(p=>{try{return fs.existsSync(p)}catch{return true}});",
     "const configTraces=configTracePaths.filter(p=>{try{const raw=fs.readFileSync(p,'utf8');return managedConfigMarkers.some(m=>raw.includes(m))}catch(e){return e&&e.code!=='ENOENT'}});",
     "console.log(JSON.stringify({ok:true,identity:!!identity,legacyTraces:traces.length,legacyConfigTraces:configTraces.length,legacyMonitorPresent:"
@@ -847,6 +855,32 @@ function buildInstallerVerificationCommand(txnStep, layout, remoteNode) {
     "const commandTokens=command.trim().split(/\\s+/);",
     "const hasEnv=(name,value)=>[name+'='+value,name+\"='\"+value+\"'\",name+'=\"'+value+'\"'].some(token=>commandTokens.includes(token));",
     "if(!hasEnv('CLAWD_REMOTE','1')||!hasEnv('CLAWD_SSH_REMOTE','1'))process.exit(4);",
+  ].join("");
+  return buildRemoteNodeEvalCommand(remoteNode, script);
+}
+
+function buildPiInstallerVerificationCommand(layout, remoteNode) {
+  const sourceFiles = {
+    "index.ts": "pi-extension.ts",
+    "pi-extension-core.js": "pi-extension-core.js",
+    "server-config.js": "server-config.js",
+  };
+  const script = [
+    "const fs=require('fs'),p=require('path');",
+    `const sourceDir=${JSON.stringify(layout.claudeHooksDir)};`,
+    `const extensionDir=${JSON.stringify(layout.piExtensionDir)};`,
+    `const sourceIdentityPath=${JSON.stringify(layout.identityFile)};`,
+    `const extensionIdentityPath=${JSON.stringify(layout.piRemoteIdentityFile)};`,
+    `const markerPath=${JSON.stringify(layout.piExtensionMarkerFile)};`,
+    `const sourceFiles=${JSON.stringify(sourceFiles)};`,
+    "const sourceIdentity=JSON.parse(fs.readFileSync(sourceIdentityPath,'utf8'));",
+    "const extensionIdentity=JSON.parse(fs.readFileSync(extensionIdentityPath,'utf8'));",
+    "for(const k of ['version','layoutVersion','runtimeKey','profileId','installId','remotePort','routingNonce','deployedAt'])if(sourceIdentity[k]!==extensionIdentity[k])process.exit(1);",
+    "const marker=JSON.parse(fs.readFileSync(markerPath,'utf8'));",
+    "if(!marker||marker.app!=='clawd-on-desk'||marker.integration!=='pi'||marker.managed!==true||!marker.remote)process.exit(3);",
+    "for(const k of ['installId','profileId','runtimeKey','layoutVersion'])if(marker.remote[k]!==sourceIdentity[k])process.exit(4);",
+    "if((fs.statSync(extensionIdentityPath).mode&0o077)!==0)process.exit(5);",
+    "for(const [target,source] of Object.entries(sourceFiles)){const a=fs.readFileSync(p.join(extensionDir,target)),b=fs.readFileSync(p.join(sourceDir,source));if(!a.equals(b))process.exit(6)}",
   ].join("");
   return buildRemoteNodeEvalCommand(remoteNode, script);
 }
@@ -1497,6 +1531,58 @@ async function secureDeploy({
       progress(progressStep, "ok");
     }
 
+    progress("install-pi", "start");
+    if (layout.runtimeMode !== "account-default") {
+      await recordStep(
+        "installPi",
+        "not-applicable",
+        "Pi uses an account-global extension directory; profile-isolated deployment is unsupported",
+      );
+      progress("install-pi", "ok", "not applicable");
+    } else {
+      const piCommand = buildRemoteHookNodeCommand(remoteNode, "pi-install.js", ["--remote", "--json"], {
+        hooksDir: layout.claudeHooksDir,
+      });
+      const piInstall = await spawnAndWait(
+        spawn,
+        "ssh",
+        buildSshArgs(profile).concat([
+          fencedCommand(layout, leaseId, remoteNode, `${envPrefix} ${piCommand}`),
+        ]),
+        { timeoutMs: 60000, runtime, role: "installer-installPi", mutation: true },
+      );
+      let piResult = null;
+      try {
+        const lines = String(piInstall.stdout || "").trim().split(/\r?\n/);
+        piResult = JSON.parse(lines[lines.length - 1]);
+      } catch {}
+      if (piInstall.code !== 0 || !piResult) {
+        return fail("install-pi", summarizeStderr(piInstall.stderr) || "Remote Pi installer failed", null, "installPi");
+      }
+      if (piResult.installed !== true) {
+        if (piResult.skipped === true && piResult.reason === "pi-not-found") {
+          await recordStep("installPi", "not-applicable", "Pi command and ~/.pi/agent were absent before deploy");
+          progress("install-pi", "ok", "not applicable");
+        } else {
+          return fail("install-pi", `Remote Pi installer skipped: ${String(piResult.reason || "unknown")}`, null, "installPi");
+        }
+      } else {
+        const piVerify = await spawnAndWait(
+          spawn,
+          "ssh",
+          buildSshArgs(profile).concat([
+            fencedCommand(layout, leaseId, remoteNode, buildPiInstallerVerificationCommand(layout, remoteNode)),
+          ]),
+          { timeoutMs: 30000, runtime, role: "installer-installPi-verify", mutation: true },
+        );
+        if (piVerify.code !== 0) {
+          return fail("install-pi", "Remote Pi extension read-back verification failed", null, "installPi");
+        }
+        await recordStep("installPi", "done", "extension, secure identity, owner marker, and source hashes read back");
+        progress("install-pi", "ok");
+      }
+    }
+
     if (!componentPresence.claudePresent) {
       await recordStep(
         "claudePermission",
@@ -2105,6 +2191,7 @@ async function secureUninstallRemoteIntegrations({
         optionalInstaller("uninstall.js", []),
         optionalInstaller("codex-install.js", ["--uninstall"]),
         optionalInstaller("copilot-install.js", ["--uninstall"]),
+        optionalInstaller("pi-install.js", ["--uninstall", "--remote", "--silent"]),
         `rm -f ${[
           layout.hostPrefixFile,
           layout.statuslineSidecarFile,
@@ -2284,6 +2371,7 @@ module.exports = {
     buildOwnershipPreflightScript,
     buildLegacyMonitorCleanupScript,
     buildInstallerVerificationCommand,
+    buildPiInstallerVerificationCommand,
     buildMonitorVerificationCommand,
     buildScpRemoteTarget,
     probeRemoteCliCapabilities,

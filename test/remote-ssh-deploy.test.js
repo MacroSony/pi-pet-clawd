@@ -104,6 +104,10 @@ function secureHappySpawn(options = {}) {
     };
     else if (current === 14) response = {
       code: 0,
+      stdout: `${JSON.stringify(options.piResult || { installed: true, skipped: false, updated: true })}\n`,
+    };
+    else if (current === 16) response = {
+      code: 0,
       stdout: `${options.permissionMode === "native" ? "native" : "managed"}\n`,
     };
     queueMicrotask(() => {
@@ -217,6 +221,7 @@ test("secure deploy holds a fenced lease, verifies every component, and never pu
     "installClaude",
     "installCodex",
     "installCopilot",
+    "installPi",
     "claudePermission",
     "codexMonitor",
   ]);
@@ -236,6 +241,14 @@ test("secure deploy holds a fenced lease, verifies every component, and never pu
   assert.ok(identityIndex > 2);
   assert.ok(markerIndex > identityIndex);
   assert.ok(scpIndex > markerIndex);
+  const piInstallCall = recorder.calls.find((call) => {
+    const command = String(call.args.at(-1));
+    return command.includes("pi-install.js") && command.includes("--remote") && command.includes("--json");
+  });
+  assert.ok(piInstallCall, "Pi installation must run through the staged remote installer");
+  const piVerifyCall = recorder.calls.find((call) =>
+    String(call.args.at(-1)).includes("pi-extension-core.js"));
+  assert.ok(piVerifyCall, "Pi installation must receive a remote read-back verification");
 
   const liveSshCalls = recorder.calls.slice(4, -1).filter((call) => call.command === "ssh");
   for (const call of liveSshCalls) {
@@ -728,8 +741,9 @@ test("every applicable identity component failure leaves the transaction uncommi
     ["install-claude", 11, "installClaude"],
     ["install-codex", 12, "installCodex"],
     ["install-copilot", 13, "installCopilot"],
-    ["claude-permission", 14, "claudePermission"],
-    ["codex-monitor", 15, "codexMonitor"],
+    ["install-pi", 14, "installPi"],
+    ["claude-permission", 16, "claudePermission"],
+    ["codex-monitor", 17, "codexMonitor"],
   ];
   for (const [expectedStep, failureIndex, txnStep] of cases) {
     const fixture = secureFixture({
@@ -785,6 +799,23 @@ test("native permission fallback and absent optional agents persist evidence-bac
   const monitor = nativeUpdates.find(([name]) => name === "codexMonitor")[1];
   assert.equal(monitor.status, "not-applicable");
   assert.ok(monitor.evidence);
+
+  const piAbsentUpdates = [];
+  const piAbsent = await secureDeploy({
+    ...fixture,
+    runtime: makeRuntimeStub(),
+    deps: {
+      spawn: secureHappySpawn({ piResult: { installed: false, skipped: true, reason: "pi-not-found" } }).spawn,
+      hooksDir: path.join(REPO_ROOT, "hooks"),
+      detectRemoteShell: stubPosixShellProbe,
+      randomBytes: () => Buffer.alloc(16, 0xab),
+      onIdentityStep: async (name, update) => piAbsentUpdates.push([name, update]),
+    },
+  });
+  assert.equal(piAbsent.ok, true);
+  const pi = piAbsentUpdates.find(([name]) => name === "installPi")[1];
+  assert.equal(pi.status, "not-applicable");
+  assert.match(pi.evidence, /Pi command/);
 });
 
 test("cleanup/start/stop all fail closed for missing or mismatched ownership identity", async () => {

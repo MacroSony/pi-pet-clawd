@@ -64,6 +64,7 @@ const REMOTE_IDENTITY_STEP_NAMES = Object.freeze([
   "installClaude",
   "installCodex",
   "installCopilot",
+  "installPi",
   "claudePermission",
   "codexMonitor",
 ]);
@@ -189,7 +190,15 @@ function sanitizeIdentityTxn(raw, expected = {}) {
   }
   const steps = {};
   for (const name of REMOTE_IDENTITY_STEP_NAMES) {
-    const step = sanitizeIdentityStep(raw.steps[name]);
+    // installPi was added after the first secure Remote SSH transaction
+    // schema shipped. Keep a committed pre-Pi deployment valid; an active
+    // transaction resumes through the new verification step on Repair.
+    const legacyPiStep = name === "installPi" && raw.steps[name] === undefined
+      ? (raw.phase === "committed"
+        ? { status: "not-applicable", evidence: "pre-pi-remote-deploy" }
+        : { status: "pending" })
+      : raw.steps[name];
+    const step = sanitizeIdentityStep(legacyPiStep);
     if (!step) return null;
     steps[name] = step;
   }

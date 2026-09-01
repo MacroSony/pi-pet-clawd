@@ -10,6 +10,7 @@ const {
   CORE_FILE,
   EXTENSION_FILE,
   MARKER_FILE,
+  REMOTE_IDENTITY_FILE,
   SERVER_CONFIG_FILE,
   hasPiCommand,
   isManagedMarker,
@@ -31,6 +32,23 @@ function makeSourceDir() {
   fs.writeFileSync(path.join(dir, CORE_FILE), "module.exports = { attach() {} };\n", "utf8");
   fs.writeFileSync(path.join(dir, SERVER_CONFIG_FILE), "module.exports = {};\n", "utf8");
   return dir;
+}
+
+function writeRemoteIdentity(overrides = {}) {
+  const file = path.join(makeTempDir(), REMOTE_IDENTITY_FILE);
+  const identity = {
+    version: 2,
+    layoutVersion: 1,
+    runtimeKey: "account-default",
+    profileId: "remote-pi",
+    installId: "a".repeat(64),
+    remotePort: 23337,
+    routingNonce: "b".repeat(32),
+    deployedAt: 1,
+    ...overrides,
+  };
+  fs.writeFileSync(file, JSON.stringify(identity), "utf8");
+  return { file, identity };
 }
 
 afterEach(() => {
@@ -131,6 +149,92 @@ describe("pi-install", () => {
     assert.strictEqual(fs.existsSync(path.join(first.extensionDir, CORE_FILE)), true);
     assert.strictEqual(fs.existsSync(path.join(first.extensionDir, SERVER_CONFIG_FILE)), true);
     assert.strictEqual(isManagedMarker(JSON.parse(fs.readFileSync(path.join(first.extensionDir, MARKER_FILE), "utf8"))), true);
+  });
+
+  it("installs a validated remote identity atomically and records its owner", () => {
+    const root = makeTempDir();
+    const sourceDir = makeSourceDir();
+    const parentDir = path.join(root, ".pi", "agent");
+    const { file: remoteIdentityPath, identity } = writeRemoteIdentity();
+
+    const result = registerPiExtension({
+      parentDir,
+      sourceDir,
+      remote: true,
+      remoteIdentityPath,
+      piCommandAvailable: true,
+      silent: true,
+    });
+
+    const installedIdentityPath = path.join(result.extensionDir, REMOTE_IDENTITY_FILE);
+    assert.strictEqual(result.installed, true);
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(installedIdentityPath, "utf8")), identity);
+    assert.strictEqual(fs.statSync(installedIdentityPath).mode & 0o777, 0o600);
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(path.join(result.extensionDir, MARKER_FILE), "utf8")).remote,
+      {
+        installId: identity.installId,
+        profileId: identity.profileId,
+        runtimeKey: identity.runtimeKey,
+        layoutVersion: identity.layoutVersion,
+      },
+    );
+  });
+
+  it("rejects invalid remote identity before changing extension files", () => {
+    const root = makeTempDir();
+    const sourceDir = makeSourceDir();
+    const parentDir = path.join(root, ".pi", "agent");
+    const { file: remoteIdentityPath } = writeRemoteIdentity({ routingNonce: "not-a-nonce" });
+
+    assert.throws(() => registerPiExtension({
+      parentDir,
+      sourceDir,
+      remote: true,
+      remoteIdentityPath,
+      piCommandAvailable: true,
+      silent: true,
+    }), /requires a valid secure identity/);
+    assert.strictEqual(fs.existsSync(path.join(parentDir, "extensions", "clawd-on-desk")), false);
+  });
+
+  it("preserves a remote extension owned by another profile during repair and uninstall", () => {
+    const root = makeTempDir();
+    const sourceDir = makeSourceDir();
+    const parentDir = path.join(root, ".pi", "agent");
+    const first = writeRemoteIdentity();
+    const installed = registerPiExtension({
+      parentDir,
+      sourceDir,
+      remote: true,
+      remoteIdentityPath: first.file,
+      piCommandAvailable: true,
+      silent: true,
+    });
+    const second = writeRemoteIdentity({ profileId: "other-profile", installId: "c".repeat(64) });
+
+    const repair = registerPiExtension({
+      parentDir,
+      sourceDir,
+      remote: true,
+      remoteIdentityPath: second.file,
+      piCommandAvailable: true,
+      silent: true,
+    });
+    const uninstall = unregisterPiExtension({
+      parentDir,
+      remote: true,
+      remoteIdentityPath: second.file,
+      silent: true,
+    });
+
+    assert.strictEqual(repair.reason, "remote-ownership-mismatch");
+    assert.strictEqual(uninstall.reason, "remote-ownership-mismatch");
+    assert.strictEqual(fs.existsSync(installed.extensionDir), true);
+    assert.deepStrictEqual(
+      JSON.parse(fs.readFileSync(path.join(installed.extensionDir, REMOTE_IDENTITY_FILE), "utf8")),
+      first.identity,
+    );
   });
 
   it("does not overwrite an unmanaged existing Pi extension directory", () => {
