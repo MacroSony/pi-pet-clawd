@@ -2,6 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert");
+const { EventEmitter } = require("node:events");
 
 const core = require("../hooks/pi-extension-core");
 const { NESTED_TERMINAL_ENV } = require("../hooks/shared-process");
@@ -324,5 +325,116 @@ describe("pi-extension-core", () => {
 
     assert.strictEqual(result, false);
     assert.deepStrictEqual(posts, []);
+  });
+});
+
+describe("Pi state transport", () => {
+  const validRemoteIdentity = Object.freeze({
+    ok: true,
+    version: 2,
+    layoutVersion: 1,
+    runtimeKey: "account-default",
+    profileId: "remote-pi",
+    installId: "a".repeat(64),
+    remotePort: 23337,
+    routingNonce: "b".repeat(32),
+    deployedAt: 1,
+  });
+
+  function requestStub(calls, respond) {
+    return (options, callback) => {
+      calls.push(options);
+      const request = new EventEmitter();
+      request.destroy = () => {};
+      request.end = () => {
+        queueMicrotask(() => {
+          const response = new EventEmitter();
+          response.headers = respond(options);
+          response.setEncoding = () => {};
+          response.resume = () => {};
+          callback(response);
+          response.emit("end");
+        });
+      };
+      return request;
+    };
+  }
+
+  function getStub(calls, respond) {
+    return (options, callback) => {
+      calls.push(options);
+      const request = new EventEmitter();
+      request.destroy = () => {};
+      queueMicrotask(() => {
+        const response = new EventEmitter();
+        response.headers = respond(options);
+        response.setEncoding = () => {};
+        response.resume = () => {};
+        callback(response);
+        response.emit("end");
+      });
+      return request;
+    };
+  }
+
+  it("keeps local runtime-first delivery with fallback probing", async () => {
+    const postCalls = [];
+    const probeCalls = [];
+    const delivered = await core.postStateToClawd({ agent_id: "pi", state: "idle" }, {
+      sshSecure: false,
+      runtimePort: 23335,
+      httpRequest: requestStub(postCalls, (options) => (
+        options.port === 23333 ? { "x-clawd-server": "clawd-on-desk" } : {}
+      )),
+      httpGet: getStub(probeCalls, (options) => (
+        options.port === 23333 ? { "x-clawd-server": "clawd-on-desk" } : {}
+      )),
+    });
+
+    assert.strictEqual(delivered, true);
+    assert.deepStrictEqual(postCalls.map((call) => call.port), [23335, 23333]);
+    assert.deepStrictEqual(probeCalls.map((call) => call.port), [23333]);
+    assert.strictEqual(postCalls[0].headers["x-clawd-routing-nonce"], undefined);
+    assert.strictEqual(postCalls[0].timeout, 100);
+  });
+
+  it("uses the remote identity's single port, nonce, and remote timeout", async () => {
+    const postCalls = [];
+    const delivered = await core.postStateToClawd({ agent_id: "pi", state: "working" }, {
+      remoteIdentity: validRemoteIdentity,
+      sshSecure: true,
+      runtimePort: 23333,
+      httpRequest: requestStub(postCalls, () => ({ "x-clawd-server": "clawd-on-desk" })),
+    });
+
+    assert.strictEqual(delivered, true);
+    assert.strictEqual(postCalls.length, 1);
+    assert.strictEqual(postCalls[0].port, 23337);
+    assert.strictEqual(postCalls[0].headers["x-clawd-routing-nonce"], "b".repeat(32));
+    assert.strictEqual(postCalls[0].timeout, 5000);
+  });
+
+  it("fails closed for an invalid secure identity and never falls back to local ports", async () => {
+    let requested = false;
+    const delivered = await core.postStateToClawd({ agent_id: "pi", state: "error" }, {
+      sshSecure: true,
+      remoteIdentity: { ok: false, reason: "identity-invalid" },
+      remoteLastLogPath: "/definitely-not-used-by-this-test",
+      fs: {
+        statSync() { throw new Error("missing"); },
+        mkdirSync() {},
+        writeFileSync() {},
+        chmodSync() {},
+        renameSync() {},
+        unlinkSync() {},
+      },
+      httpRequest() {
+        requested = true;
+        throw new Error("must not request when identity is invalid");
+      },
+    });
+
+    assert.strictEqual(delivered, false);
+    assert.strictEqual(requested, false);
   });
 });

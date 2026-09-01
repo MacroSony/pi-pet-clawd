@@ -1,5 +1,11 @@
 "use strict";
 
+// This module deliberately delegates state delivery to the same transport used
+// by every other Clawd hook. In particular, server-config detects a colocated
+// clawd-remote.json and then pins the remote forward port, attaches the routing
+// nonce, and fails closed rather than scanning local ports.
+const serverConfig = require("./server-config");
+
 const PI_AGENT_ID = "pi";
 const PI_HOOK_SOURCE = "pi-extension";
 
@@ -166,6 +172,23 @@ function buildPayload(options = {}) {
   return payload;
 }
 
+function postStateToClawd(payload, options = {}) {
+  // A Pi extension is loaded in a fresh Pi process, so it does not inherit the
+  // deployer's CLAWD_REMOTE environment. Preserve server-config's normal local
+  // behavior, but explicitly select its remote timeout when its colocated
+  // identity activates secure transport.
+  const deliveryOptions = serverConfig.isSshSecureMode(options)
+    ? { ...options, remote: true }
+    : options;
+  return new Promise((resolve) => {
+    try {
+      serverConfig.postStateToRunningServer(payload, deliveryOptions, (ok) => resolve(ok === true));
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 function chainDelivery(chains, key, task) {
   const previous = chains.get(key) || Promise.resolve();
   const next = previous
@@ -251,6 +274,7 @@ const api = {
   buildPayload,
   isInteractiveMode,
   parseMode,
+  postStateToClawd,
   shouldReport,
 };
 

@@ -1,20 +1,10 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionEvent } from "@earendil-works/pi-coding-agent";
 import * as childProcess from "node:child_process";
-import * as fs from "node:fs";
-import * as http from "node:http";
-import * as os from "node:os";
 import * as path from "node:path";
 import coreModule from "./pi-extension-core.js";
 
 const core = ((coreModule as any).default || coreModule) as any;
 
-const CLAWD_SERVER_ID = "clawd-on-desk";
-const CLAWD_SERVER_HEADER = "x-clawd-server";
-const STATE_PATH = "/state";
-const DEFAULT_SERVER_PORT = 23333;
-const SERVER_PORTS = [23333, 23334, 23335, 23336, 23337];
-const RUNTIME_CONFIG_PATH = path.join(os.homedir(), ".clawd", "runtime.json");
-const HTTP_TIMEOUT_MS = 150;
 const PROCESS_METADATA_TTL_MS = 2000;
 
 type ProcessMetadata = {
@@ -95,90 +85,6 @@ function getPlatformProcessConfig() {
 }
 
 let processMetadataCache: { at: number; value: ProcessMetadata } | null = null;
-
-function normalizePort(value: unknown): number | null {
-  const port = Number(value);
-  return Number.isInteger(port) && SERVER_PORTS.includes(port) ? port : null;
-}
-
-function readRuntimePort(): number | null {
-  try {
-    const raw = JSON.parse(fs.readFileSync(RUNTIME_CONFIG_PATH, "utf8"));
-    return normalizePort(raw && raw.port);
-  } catch {
-    return null;
-  }
-}
-
-function getPortCandidates(): number[] {
-  const ports: number[] = [];
-  const seen = new Set<number>();
-  const add = (port: number | null) => {
-    if (!port || seen.has(port)) return;
-    seen.add(port);
-    ports.push(port);
-  };
-  add(readRuntimePort());
-  add(DEFAULT_SERVER_PORT);
-  for (const port of SERVER_PORTS) add(port);
-  return ports;
-}
-
-function readHeader(res: http.IncomingMessage, headerName: string): string | undefined {
-  const value = res.headers[headerName];
-  return Array.isArray(value) ? value[0] : value;
-}
-
-function isClawdResponse(res: http.IncomingMessage, body: string): boolean {
-  if (readHeader(res, CLAWD_SERVER_HEADER) === CLAWD_SERVER_ID) return true;
-  if (!body) return false;
-  try {
-    const parsed = JSON.parse(body);
-    return parsed && parsed.app === CLAWD_SERVER_ID;
-  } catch {
-    return false;
-  }
-}
-
-function postStateToPort(port: number, payload: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const req = http.request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path: STATE_PATH,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-        timeout: HTTP_TIMEOUT_MS,
-      },
-      (res) => {
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => {
-          if (body.length < 256) body += chunk;
-        });
-        res.on("end", () => resolve(isClawdResponse(res, body)));
-      }
-    );
-    req.on("error", () => resolve(false));
-    req.on("timeout", () => {
-      req.destroy();
-      resolve(false);
-    });
-    req.end(payload);
-  });
-}
-
-async function postState(payload: Record<string, unknown>): Promise<boolean> {
-  const body = JSON.stringify(payload);
-  for (const port of getPortCandidates()) {
-    if (await postStateToPort(port, body)) return true;
-  }
-  return false;
-}
 
 function normalizeProcessName(name: string): string {
   return path.basename(String(name || "").trim()).toLowerCase();
@@ -331,6 +237,6 @@ export default function clawdPiExtension(pi: ExtensionAPI): void {
       metadata: getProcessMetadata(),
       agentPid: process.pid,
     }),
-    postState,
+    postState: core.postStateToClawd,
   });
 }

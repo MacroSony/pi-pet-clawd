@@ -11,6 +11,7 @@ const { resolveNodeBin } = require("./server-config");
 const EXTENSION_DIR_NAME = "clawd-on-desk";
 const EXTENSION_FILE = "index.ts";
 const CORE_FILE = "pi-extension-core.js";
+const SERVER_CONFIG_FILE = "server-config.js";
 const MARKER_FILE = ".clawd-managed.json";
 const DEFAULT_PARENT_DIR = path.join(os.homedir(), ".pi", "agent");
 const DEFAULT_EXTENSIONS_DIR = path.join(DEFAULT_PARENT_DIR, "extensions");
@@ -141,11 +142,14 @@ function readSourceFiles(options = {}) {
   const sourceDir = options.sourceDir || __dirname;
   const extensionPath = options.extensionSourcePath || resolveSourcePath("pi-extension.ts", sourceDir);
   const corePath = options.coreSourcePath || resolveSourcePath(CORE_FILE, sourceDir);
+  const serverConfigPath = options.serverConfigSourcePath || resolveSourcePath(SERVER_CONFIG_FILE, sourceDir);
   return {
     extensionPath,
     corePath,
+    serverConfigPath,
     extensionText: fs.readFileSync(extensionPath, "utf8"),
     coreText: fs.readFileSync(corePath, "utf8"),
+    serverConfigText: fs.readFileSync(serverConfigPath, "utf8"),
   };
 }
 
@@ -156,6 +160,7 @@ function registerPiExtension(options = {}) {
   const markerPath = path.join(extensionDir, MARKER_FILE);
   const extensionPath = path.join(extensionDir, EXTENSION_FILE);
   const corePath = path.join(extensionDir, CORE_FILE);
+  const serverConfigPath = path.join(extensionDir, SERVER_CONFIG_FILE);
 
   const parentExists = dirExists(parentDir, fsImpl);
   if (!parentExists && !hasPiCommand(options)) {
@@ -173,14 +178,18 @@ function registerPiExtension(options = {}) {
     return { installed: false, skipped: true, updated: false, reason: "unmanaged-existing-extension", extensionDir };
   }
 
-  const { extensionText, coreText } = readSourceFiles(options);
+  const { extensionText, coreText, serverConfigText } = readSourceFiles(options);
   const previousExtension = fileExists(extensionPath, fsImpl) ? fsImpl.readFileSync(extensionPath, "utf8") : null;
   const previousCore = fileExists(corePath, fsImpl) ? fsImpl.readFileSync(corePath, "utf8") : null;
-  const updated = previousExtension !== extensionText || previousCore !== coreText;
+  const previousServerConfig = fileExists(serverConfigPath, fsImpl) ? fsImpl.readFileSync(serverConfigPath, "utf8") : null;
+  const updated = previousExtension !== extensionText
+    || previousCore !== coreText
+    || previousServerConfig !== serverConfigText;
 
   fsImpl.mkdirSync(extensionDir, { recursive: true });
   writeTextAtomic(extensionPath, extensionText);
   writeTextAtomic(corePath, coreText);
+  writeTextAtomic(serverConfigPath, serverConfigText);
   writeJsonAtomic(markerPath, buildMarker());
 
   if (!options.silent) {
@@ -217,6 +226,7 @@ module.exports = {
   EXTENSION_DIR_NAME,
   EXTENSION_FILE,
   MARKER_FILE,
+  SERVER_CONFIG_FILE,
   buildMarker,
   hasPiCommand,
   isManagedMarker,

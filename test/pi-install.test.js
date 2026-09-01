@@ -10,6 +10,7 @@ const {
   CORE_FILE,
   EXTENSION_FILE,
   MARKER_FILE,
+  SERVER_CONFIG_FILE,
   hasPiCommand,
   isManagedMarker,
   registerPiExtension,
@@ -28,6 +29,7 @@ function makeSourceDir() {
   const dir = makeTempDir();
   fs.writeFileSync(path.join(dir, "pi-extension.ts"), "export default function clawdPiExtension() {}\n", "utf8");
   fs.writeFileSync(path.join(dir, CORE_FILE), "module.exports = { attach() {} };\n", "utf8");
+  fs.writeFileSync(path.join(dir, SERVER_CONFIG_FILE), "module.exports = {};\n", "utf8");
   return dir;
 }
 
@@ -127,6 +129,7 @@ describe("pi-install", () => {
     assert.strictEqual(second.updated, false);
     assert.strictEqual(fs.existsSync(path.join(first.extensionDir, EXTENSION_FILE)), true);
     assert.strictEqual(fs.existsSync(path.join(first.extensionDir, CORE_FILE)), true);
+    assert.strictEqual(fs.existsSync(path.join(first.extensionDir, SERVER_CONFIG_FILE)), true);
     assert.strictEqual(isManagedMarker(JSON.parse(fs.readFileSync(path.join(first.extensionDir, MARKER_FILE), "utf8"))), true);
   });
 
