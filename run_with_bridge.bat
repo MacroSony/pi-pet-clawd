@@ -6,6 +6,7 @@ REM without depending on the caller's current directory.
 for %%I in ("%~dp0..") do set "PI_PET_ROOT=%%~fI"
 
 set "CLAWD_PET_BRIDGE=1"
+set "CLAWD_PET_BRIDGE_HIDE_NATIVE_PET=1"
 set "CLAWD_PET_BRIDGE_STATUS_DIR=%USERPROFILE%\.pi-pet\status"
 set "CLAWD_PET_BRIDGE_RENDERER_BIN=%PI_PET_ROOT%\claude-status-pet\pet-app\src-tauri\target\release\claude-status-pet.exe"
 

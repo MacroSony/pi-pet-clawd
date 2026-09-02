@@ -8,6 +8,7 @@ const serverConfig = require("./server-config");
 
 const PI_AGENT_ID = "pi";
 const PI_HOOK_SOURCE = "pi-extension";
+const HEARTBEAT_INTERVAL_MS = 60_000;
 
 // Kept in step with hooks/shared-process.js NESTED_TERMINAL_ENV; duplicated
 // rather than imported because this module ships standalone in the Pi extension.
@@ -30,7 +31,6 @@ const DEFAULT_EVENT_BINDINGS = Object.freeze([
   Object.freeze(["agent_end", "Stop", "attention"]),
   Object.freeze(["session_before_compact", "PreCompact", "sweeping"]),
   Object.freeze(["session_compact", "PostCompact", "attention"]),
-  Object.freeze(["session_shutdown", "SessionEnd", "sleeping"]),
 ]);
 
 function parseMode(argv = process.argv) {
@@ -169,6 +169,7 @@ function buildPayload(options = {}) {
   }
 
   addToolFields(payload, options.nativeEvent);
+  if (options.livenessOnly === true) payload.liveness_only = true;
   return payload;
 }
 
@@ -211,9 +212,17 @@ function attach(pi, deps = {}) {
   const shouldReportFn = typeof deps.shouldReport === "function" ? deps.shouldReport : shouldReport;
   const buildPayloadFn = typeof deps.buildPayload === "function" ? deps.buildPayload : buildPayload;
   const postStateFn = typeof deps.postState === "function" ? deps.postState : () => false;
+  const setIntervalFn = typeof deps.setInterval === "function" ? deps.setInterval : setInterval;
+  const clearIntervalFn = typeof deps.clearInterval === "function" ? deps.clearInterval : clearInterval;
+  const heartbeatIntervalMs = Number.isFinite(deps.heartbeatIntervalMs)
+    ? Math.max(1, Math.floor(deps.heartbeatIntervalMs))
+    : HEARTBEAT_INTERVAL_MS;
   const deliveryChains = new Map();
+  let heartbeatTimer = null;
+  let latestCtx = null;
+  let lifecycleIdle = true;
 
-  function send(state, event, nativeEvent, ctx, waitForDelivery = false) {
+  function send(state, event, nativeEvent, ctx, waitForDelivery = false, sendOptions = {}) {
     let report;
     try {
       report = shouldReportFn(ctx);
@@ -223,7 +232,7 @@ function attach(pi, deps = {}) {
     if (!report) return waitForDelivery ? Promise.resolve(false) : false;
     let payload;
     try {
-      payload = buildPayloadFn({ state, event, nativeEvent, ctx });
+      payload = buildPayloadFn({ state, event, nativeEvent, ctx, ...sendOptions });
     } catch {
       return waitForDelivery ? Promise.resolve(false) : false;
     }
@@ -234,8 +243,45 @@ function attach(pi, deps = {}) {
     return true;
   }
 
+  function rememberContext(ctx) {
+    if (ctx) latestCtx = ctx;
+  }
+
+  function contextIsIdle(ctx) {
+    if (ctx && typeof ctx.isIdle === "function") {
+      try { return ctx.isIdle() === true; } catch { return false; }
+    }
+    return lifecycleIdle;
+  }
+
+  function stopHeartbeat() {
+    if (!heartbeatTimer) return;
+    clearIntervalFn(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+
+  function startHeartbeat() {
+    if (heartbeatTimer) return;
+    heartbeatTimer = setIntervalFn(() => {
+      const ctx = latestCtx;
+      if (!ctx || !contextIsIdle(ctx)) return;
+      send(
+        "idle",
+        "SessionHeartbeat",
+        { type: "session_heartbeat" },
+        ctx,
+        false,
+        { livenessOnly: true }
+      );
+    }, heartbeatIntervalMs);
+    // A liveness timer must never keep a CLI process alive on its own.
+    if (heartbeatTimer && typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+  }
+
   function handleToolCall(nativeEvent, ctx) {
     try {
+      rememberContext(ctx);
+      lifecycleIdle = false;
       send("working", "PreToolUse", nativeEvent, ctx);
       return undefined;
     } catch {
@@ -244,13 +290,32 @@ function attach(pi, deps = {}) {
   }
 
   for (const [nativeName, clawdEvent, state] of DEFAULT_EVENT_BINDINGS) {
-    const wait = nativeName === "agent_end" || nativeName === "session_shutdown";
-    pi.on(nativeName, (nativeEvent, ctx) => send(state, clawdEvent, nativeEvent, ctx, wait));
+    const wait = nativeName === "agent_end";
+    pi.on(nativeName, (nativeEvent, ctx) => {
+      rememberContext(ctx);
+      if (nativeName === "session_start" || nativeName === "agent_end" || nativeName === "session_compact") {
+        lifecycleIdle = true;
+      } else if (nativeName === "before_agent_start" || nativeName === "session_before_compact") {
+        lifecycleIdle = false;
+      }
+      if (nativeName === "session_start") startHeartbeat();
+      return send(state, clawdEvent, nativeEvent, ctx, wait);
+    });
   }
+
+  pi.on("session_shutdown", (nativeEvent, ctx) => {
+    rememberContext(ctx);
+    stopHeartbeat();
+    // Pi emits session_shutdown for an extension reload as well as for a real
+    // logical session replacement/quit. Reload must not retire a live pet.
+    if (nativeEvent && nativeEvent.reason === "reload") return false;
+    return send("sleeping", "SessionEnd", nativeEvent, ctx, true);
+  });
 
   pi.on("tool_call", handleToolCall);
 
   pi.on("tool_result", (nativeEvent, ctx) => {
+    rememberContext(ctx);
     const isError = !!(nativeEvent && nativeEvent.isError);
     // Await failed tool delivery so a following lifecycle event cannot hide
     // the error state before Clawd receives it.
@@ -263,7 +328,7 @@ function attach(pi, deps = {}) {
     );
   });
 
-  return { deliveryChains, send };
+  return { deliveryChains, send, startHeartbeat, stopHeartbeat };
 }
 
 const api = {

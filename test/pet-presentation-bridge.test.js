@@ -116,7 +116,7 @@ describe("pet presentation bridge", () => {
     assert.strictEqual(payload.session_id, petId);
   });
 
-  it("closes a previously projected session once it drops out of Clawd's snapshot", () => {
+  it("marks a missing snapshot session offline instead of fabricating SessionEnd", () => {
     const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
     temporaryDirs.push(statusDir);
     const bridge = createPetPresentationBridge({ enabled: true, statusDir });
@@ -127,7 +127,33 @@ describe("pet presentation bridge", () => {
     bridge.onSnapshot({ sessions: [] });
 
     const payload = JSON.parse(fs.readFileSync(path.join(statusDir, `status-${petId}.json`), "utf8"));
+    assert.strictEqual(payload.state, "offline");
+    assert.strictEqual(payload.event, "SessionMissing");
+  });
+
+  it("closes only an authoritative lifecycle end and keeps its stable identity", () => {
+    const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
+    temporaryDirs.push(statusDir);
+    const bridge = createPetPresentationBridge({ enabled: true, statusDir });
+    const session = makeSession();
+    const petId = stablePetSessionId(session);
+
+    bridge.onSnapshot({ sessions: [session] });
+    assert.strictEqual(bridge.onSessionEnd(session), true);
+    bridge.onSnapshot({ sessions: [] });
+
+    const payload = JSON.parse(fs.readFileSync(path.join(statusDir, `status-${petId}.json`), "utf8"));
     assert.strictEqual(payload.state, "closed");
     assert.strictEqual(payload.event, "SessionEnd");
+  });
+
+  it("enables native-pet hiding only when both Bridge flags are truthy", () => {
+    assert.strictEqual(createPetPresentationBridge.shouldHideNativePetFromEnv({
+      CLAWD_PET_BRIDGE: "1",
+      CLAWD_PET_BRIDGE_HIDE_NATIVE_PET: "yes",
+    }), true);
+    assert.strictEqual(createPetPresentationBridge.shouldHideNativePetFromEnv({
+      CLAWD_PET_BRIDGE_HIDE_NATIVE_PET: "1",
+    }), false);
   });
 });

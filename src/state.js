@@ -2567,6 +2567,21 @@ function updateSession(sessionId, state, event, opts = {}) {
         reason: "session-end",
       });
     }
+    // Snapshot omission alone is ambiguous (stale cleanup, SSH disconnect,
+    // restart). Give presentation consumers the authoritative lifecycle edge
+    // before deleting the registry entry so they can close rather than merely
+    // mark the session offline.
+    if (typeof ctx.onPresentationSessionEnd === "function") {
+      try {
+        ctx.onPresentationSessionEnd({
+          ...(endingSession || {}),
+          id: sessionId,
+          rawSessionId: (endingSession && endingSession.rawSessionId) || rawSessionId || sessionId,
+          profileId: (endingSession && endingSession.profileId) || profileId || "local",
+          agentId: (endingSession && endingSession.agentId) || srcAgentId,
+        });
+      } catch {}
+    }
     deleteSessionWithCompletionCleanup(sessionId, "session-end");
     debugSession(`session-end delete ${describeSession(sessionId, endingSession)}`);
     cleanStaleSessions();

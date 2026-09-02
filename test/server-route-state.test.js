@@ -190,6 +190,52 @@ describe("server-route-state health", () => {
 });
 
 describe("server-route-state POST", () => {
+  it("touches an existing Pi heartbeat without changing lifecycle state", async () => {
+    const touches = [];
+    const result = await callStatePost(JSON.stringify({
+      agent_id: "pi",
+      hook_source: "pi-extension",
+      session_id: "pi:live",
+      event: "SessionHeartbeat",
+      state: "idle",
+      liveness_only: true,
+    }), {
+      ctx: {
+        touchSessionActivity: (...args) => { touches.push(args); return true; },
+      },
+    });
+
+    assert.strictEqual(result.statusCode, 204);
+    assert.deepStrictEqual(touches, [[localSessionKey("pi:live"), {
+      agentId: "pi",
+      profileId: "local",
+    }]]);
+    assert.strictEqual(result.calls.updateSession.length, 0);
+  });
+
+  it("rehydrates a missing Pi heartbeat as the same stable idle session", async () => {
+    const result = await callStatePost(JSON.stringify({
+      agent_id: "pi",
+      hook_source: "pi-extension",
+      session_id: "pi:restored",
+      event: "SessionHeartbeat",
+      state: "working",
+      liveness_only: true,
+      cwd: "/srv/project",
+    }), {
+      ctx: { touchSessionActivity: () => false },
+    });
+
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(result.calls.updateSession.length, 1);
+    assert.deepStrictEqual(result.calls.updateSession[0].slice(0, 3), [
+      localSessionKey("pi:restored"),
+      "idle",
+      "SessionStart",
+    ]);
+    assert.strictEqual(result.calls.updateSession[0][3].rawSessionId, "pi:restored");
+  });
+
   it("enforces DSH upstream sequence order across created, event, and disposed callbacks", async () => {
     const fence = createDshStateSequenceFence();
     const post = (event, state, sequence = {}) => callStatePost(JSON.stringify({

@@ -182,6 +182,8 @@ const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
 const createPetPresentationBridge = require("./pet-presentation-bridge");
+const petPresentationBridgeEnabled = createPetPresentationBridge.isEnabledFromEnv(process.env);
+const petBridgeHidesNativePet = createPetPresentationBridge.shouldHideNativePetFromEnv(process.env);
 const { collectRequiredAssetFiles } = require("./theme-schema");
 const { describeGeometrySync } = require("./pet-accessory-state");
 const { createDisplayedVisualProjection } = require("./displayed-visual-projection");
@@ -1371,6 +1373,7 @@ function prepManualPetVisibility() {
   }
 }
 function togglePetVisibility() {
+  if (petBridgeHidesNativePet) return petWindowRuntime.setPetHidden(true);
   prepManualPetVisibility();
   return petWindowRuntime.togglePetVisibility();
 }
@@ -1379,6 +1382,7 @@ function togglePetVisibility() {
 // lands while the menu is open degrades to a no-op instead of inverting the
 // action (see menu.js).
 function setPetVisibility(visible) {
+  if (petBridgeHidesNativePet) return petWindowRuntime.setPetHidden(true);
   prepManualPetVisibility();
   return petWindowRuntime.setPetHidden(!visible);
 }
@@ -2125,7 +2129,7 @@ let notifyUpdaterSilentExit = () => {};
 // Clawd's own renderer stays unchanged (one aggregate pet); this consumer gets
 // the same authoritative snapshot fan-out as Dashboard/HUD/notifications.
 const petPresentationBridge = createPetPresentationBridge({
-  enabled: createPetPresentationBridge.isEnabledFromEnv(process.env),
+  enabled: petPresentationBridgeEnabled,
   statusDir: process.env.CLAWD_PET_BRIDGE_STATUS_DIR,
   rendererBinary: process.env.CLAWD_PET_BRIDGE_RENDERER_BIN,
   assetsDir: process.env.CLAWD_PET_BRIDGE_ASSETS_DIR,
@@ -2296,6 +2300,11 @@ const _stateCtx = {
     _settingsController.get("permissionAutomationMode") || "off",
   onSessionAutomationLifecycleEnd: (payload) => {
     if (sessionAutomationCoordinator) sessionAutomationCoordinator.onSessionLifecycleEnd(payload);
+  },
+  onPresentationSessionEnd: (entry) => {
+    try { petPresentationBridge.onSessionEnd(entry); } catch (error) {
+      sessionLog(`[pet-bridge] session-end projection failed: ${error && error.message}`);
+    }
   },
   getIdleVisualChoice,
   isAgentEnabled: (agentId) => _runtimeAgentGate.isAgentEnabled(agentId),
@@ -2806,6 +2815,7 @@ const _serverCtx = {
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),
   setState,
   updateSession: agentRuntime.updateSessionFromServer,
+  touchSessionActivity: (sessionId, opts) => _state.touchSessionActivity(sessionId, opts),
   updateSessionMetadata: (sessionId, opts) => _state.updateSessionMetadata(sessionId, opts),
   clearClaudeStatuslineAuthority: (profileId) => _state.clearClaudeStatuslineAuthority(profileId),
   clearLocalClaudeQuota: () => _state.clearLocalClaudeQuota(),
@@ -5327,7 +5337,9 @@ if (!gotTheLock) {
   ) ? null : _initialPrefsLoad.snapshot;
   _syncCodexAutoStartGate(startupGateSnapshot, "startup");
   app.on("second-instance", (_event, commandLine) => {
-    if (petWindowRuntime.isPetEffectivelyHidden()) {
+    if (petBridgeHidesNativePet) {
+      petWindowRuntime.setPetHidden(true);
+    } else if (petWindowRuntime.isPetEffectivelyHidden()) {
       prepManualPetVisibility();
       petWindowRuntime.setPetHidden(false);
     } else {
@@ -5488,6 +5500,7 @@ if (!gotTheLock) {
     catch (err) { console.warn("Clawd: discord presence startup failed:", err && err.message); }
     queueFeishuApprovalSync("startup");
     createWindow();
+    if (petBridgeHidesNativePet) petWindowRuntime.setPetHidden(true);
     try { recapRuntime.start(); }
     catch (err) { console.warn("Clawd: local recap startup failed:", err && err.code ? err.code : "storage-error"); }
     // Reconcile the local quota binding only after the app has visible UI.

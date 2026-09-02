@@ -162,6 +162,62 @@ describe("pi-extension-core", () => {
     assert.strictEqual(posts[0].agent_pid, 999);
   });
 
+  it("heartbeats only while idle and treats extension reload as non-terminal", async () => {
+    const handlers = {};
+    let intervalCallback = null;
+    let cleared = false;
+    const posts = [];
+    const pi = { on(name, handler) { handlers[name] = handler; } };
+    const ctx = makeCtx({ isIdle: () => true });
+    core.attach(pi, {
+      shouldReport: () => true,
+      heartbeatIntervalMs: 10,
+      setInterval: (callback) => {
+        intervalCallback = callback;
+        return { unref() {} };
+      },
+      clearInterval: () => { cleared = true; },
+      buildPayload: ({ state, event, nativeEvent, ctx: eventCtx, livenessOnly }) => core.buildPayload({
+        state,
+        event,
+        nativeEvent,
+        ctx: eventCtx,
+        livenessOnly,
+      }),
+      postState: async (payload) => { posts.push(payload); return true; },
+    });
+
+    handlers.session_start({ type: "session_start" }, ctx);
+    intervalCallback();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(posts.map((payload) => [payload.event, payload.liveness_only]), [
+      ["SessionStart", undefined],
+      ["SessionHeartbeat", true],
+    ]);
+
+    const beforeReload = posts.length;
+    await handlers.session_shutdown({ type: "session_shutdown", reason: "reload" }, ctx);
+    assert.strictEqual(cleared, true);
+    assert.strictEqual(posts.length, beforeReload);
+  });
+
+  it("reports a real Pi quit as SessionEnd", async () => {
+    const handlers = {};
+    const posts = [];
+    core.attach({ on(name, handler) { handlers[name] = handler; } }, {
+      shouldReport: () => true,
+      postState: async (payload) => { posts.push(payload); return true; },
+    });
+
+    await handlers.session_shutdown({ type: "session_shutdown", reason: "quit" }, makeCtx());
+
+    assert.deepStrictEqual(posts.map((payload) => [payload.event, payload.state]), [
+      ["SessionEnd", "sleeping"],
+    ]);
+  });
+
   it("reports mutating tool calls as state only and never asks for permission", async () => {
     const handlers = {};
     const pi = {

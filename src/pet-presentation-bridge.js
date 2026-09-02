@@ -17,9 +17,17 @@ const PET_ID_HASH_LENGTH = 24;
 const MAX_LABEL_LENGTH = 120;
 const MAX_DETAIL_LENGTH = 180;
 
+function isTruthyEnv(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
 function isEnabledFromEnv(env = process.env) {
-  const value = String(env.CLAWD_PET_BRIDGE || "").trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
+  return isTruthyEnv(env.CLAWD_PET_BRIDGE);
+}
+
+function shouldHideNativePetFromEnv(env = process.env) {
+  return isEnabledFromEnv(env) && isTruthyEnv(env.CLAWD_PET_BRIDGE_HIDE_NATIVE_PET);
 }
 
 function defaultStatusDir(env = process.env) {
@@ -155,6 +163,7 @@ function createPetPresentationBridge(options = {}) {
   const log = typeof options.log === "function" ? options.log : () => {};
   const now = typeof options.now === "function" ? options.now : () => new Date();
   const launchedIds = new Set();
+  const launchedProcesses = new Map();
   const known = new Map();
 
   function statusPathFor(petId) {
@@ -172,29 +181,58 @@ function createPetPresentationBridge(options = {}) {
         stdio: "ignore",
         windowsHide: true,
       });
+      if (child) launchedProcesses.set(payload.session_id, child);
+      const releaseLaunch = () => {
+        if (launchedProcesses.get(payload.session_id) !== child) return;
+        launchedProcesses.delete(payload.session_id);
+        launchedIds.delete(payload.session_id);
+      };
       if (child && typeof child.unref === "function") child.unref();
       if (child && typeof child.once === "function") {
-        child.once("error", (error) => log(`renderer launch failed for ${payload.session_id}: ${error.message}`));
+        child.once("error", (error) => {
+          releaseLaunch();
+          log(`renderer launch failed for ${payload.session_id}: ${error.message}`);
+        });
+        child.once("exit", releaseLaunch);
       }
     } catch (error) {
       log(`renderer launch threw for ${payload.session_id}: ${error.message}`);
     }
   }
 
-  function closeMissingSessions(seenIds) {
+  function markMissingSessionsOffline(seenIds) {
     for (const [petId, prior] of known) {
-      if (seenIds.has(petId)) continue;
-      const closed = {
+      if (seenIds.has(petId) || prior.state === "offline") continue;
+      // A snapshot omission can mean stale cleanup, Remote SSH disconnect, or
+      // a transient Clawd restart. It is not proof that the agent ended.
+      const offline = {
         ...prior,
-        state: "closed",
-        detail: "Session ended",
-        event: "SessionEnd",
+        state: "offline",
+        detail: "Connection lost",
+        event: "SessionMissing",
         timestamp: now().toISOString(),
       };
-      writeStatusFile(statusPathFor(petId), closed, fsApi);
-      known.delete(petId);
-      launchedIds.delete(petId);
+      writeStatusFile(statusPathFor(petId), offline, fsApi);
+      known.set(petId, offline);
     }
+  }
+
+  function onSessionEnd(entry) {
+    if (!enabled || !entry || entry.headless === true || !agentIds.has(entry.agentId)) return false;
+    const petId = stablePetSessionId(entry);
+    const prior = known.get(petId) || toStatusPayload(entry, now());
+    const closed = {
+      ...prior,
+      state: "closed",
+      detail: "Session ended",
+      event: "SessionEnd",
+      timestamp: now().toISOString(),
+    };
+    writeStatusFile(statusPathFor(petId), closed, fsApi);
+    known.delete(petId);
+    launchedIds.delete(petId);
+    launchedProcesses.delete(petId);
+    return true;
   }
 
   function onSnapshot(snapshot) {
@@ -215,11 +253,12 @@ function createPetPresentationBridge(options = {}) {
       launchRenderer(payload, statusPath);
       if (!wasLaunched && launchedIds.has(payload.session_id)) launched += 1;
     }
-    closeMissingSessions(seenIds);
+    markMissingSessionsOffline(seenIds);
     return { written, launched };
   }
 
   return {
+    onSessionEnd,
     onSnapshot,
     statusPathFor,
     get enabled() { return enabled; },
@@ -230,6 +269,7 @@ module.exports = createPetPresentationBridge;
 module.exports.activityDetail = activityDetail;
 module.exports.defaultStatusDir = defaultStatusDir;
 module.exports.isEnabledFromEnv = isEnabledFromEnv;
+module.exports.shouldHideNativePetFromEnv = shouldHideNativePetFromEnv;
 module.exports.presentationState = presentationState;
 module.exports.stablePetSessionId = stablePetSessionId;
 module.exports.statusForTool = statusForTool;

@@ -1943,6 +1943,38 @@ describe("updateSession()", () => {
     assert.ok(!api.sessions.has("s1"));
   });
 
+  it("publishes authoritative presentation identity before SessionEnd deletion", () => {
+    api.cleanup();
+    const ended = [];
+    api = require("../src/state")(makeCtx({
+      onPresentationSessionEnd: (entry) => ended.push(entry),
+    }));
+    update(api, {
+      id: "canonical-pi",
+      rawSessionId: "pi:raw-pi",
+      profileId: "homelab",
+      agentId: "pi",
+      state: "idle",
+      event: "SessionStart",
+      host: "Homelab",
+    });
+    update(api, {
+      id: "canonical-pi",
+      rawSessionId: "pi:raw-pi",
+      profileId: "homelab",
+      agentId: "pi",
+      state: "sleeping",
+      event: "SessionEnd",
+      host: "Homelab",
+    });
+
+    assert.strictEqual(ended.length, 1);
+    assert.strictEqual(ended[0].id, "canonical-pi");
+    assert.strictEqual(ended[0].rawSessionId, "pi:raw-pi");
+    assert.strictEqual(ended[0].profileId, "homelab");
+    assert.strictEqual(ended[0].agentId, "pi");
+  });
+
   it("clears session automation before a main SessionEnd but not a subagent lifecycle event", () => {
     api.cleanup();
     const lifecycle = [];

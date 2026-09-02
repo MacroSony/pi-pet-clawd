@@ -405,6 +405,13 @@ function handleStatePost(req, res, options) {
       // around the full updateSession lifecycle machine.
       const metadataOnly = data.metadata_only === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
+      // Pi runs inside the interactive CLI, so a low-frequency idle heartbeat
+      // is authoritative process liveness. Existing sessions are touched
+      // without changing state/recent events; after a Clawd restart or a long
+      // tunnel outage, the same heartbeat may rehydrate the stable session.
+      const piLivenessOnly = data.liveness_only === true
+        && agentId === "pi"
+        && hookSource === "pi-extension";
       // #406 completion-gate inputs from the Claude Stop hook. Counts / boolean
       // only — the hook never forwards task command or description text.
       const backgroundTasksCount = Number.isFinite(data.background_tasks_count)
@@ -426,6 +433,25 @@ function handleStatePost(req, res, options) {
         res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
         res.end();
         return;
+      }
+      if (piLivenessOnly) {
+        const touched = typeof ctx.touchSessionActivity === "function"
+          && ctx.touchSessionActivity(session_id || "default", {
+            agentId,
+            profileId: sessionIdentity.profileId,
+          }) === true;
+        if (touched) {
+          // Heartbeats are transport/liveness evidence, not hook diagnostics.
+          res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+          res.end();
+          return;
+        }
+        // A heartbeat from an in-process interactive extension is enough to
+        // restore an idle row after Clawd itself restarted or the profile was
+        // disconnected past its retention window. The canonical profile/raw
+        // identity computed above preserves the prior pet ID.
+        state = "idle";
+        event = "SessionStart";
       }
       if (agentId === "deepseek-harness") {
         const sequenceResult = dshStateSequenceFence
