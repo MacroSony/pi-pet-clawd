@@ -170,6 +170,7 @@ describe("pi-install", () => {
     assert.strictEqual(result.installed, true);
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(installedIdentityPath, "utf8")), identity);
     assert.strictEqual(fs.statSync(installedIdentityPath).mode & 0o777, 0o600);
+    assert.strictEqual(fs.statSync(result.extensionDir).mode & 0o777, 0o700);
     assert.deepStrictEqual(
       JSON.parse(fs.readFileSync(path.join(result.extensionDir, MARKER_FILE), "utf8")).remote,
       {

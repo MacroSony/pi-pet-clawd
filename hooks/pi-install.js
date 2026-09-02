@@ -262,6 +262,9 @@ function registerPiExtension(options = {}) {
     || (remoteIdentityText !== null && previousRemoteIdentity !== remoteIdentityText);
 
   fsImpl.mkdirSync(extensionDir, { recursive: true });
+  // The secure identity is 0600; make its containing extension private as
+  // well so another account cannot replace the file through the directory.
+  if (remoteIdentity) fsImpl.chmodSync(extensionDir, 0o700);
   writeTextAtomic(extensionPath, extensionText);
   writeTextAtomic(corePath, coreText);
   writeTextAtomic(serverConfigPath, serverConfigText);

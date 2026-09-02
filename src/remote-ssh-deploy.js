@@ -880,7 +880,8 @@ function buildPiInstallerVerificationCommand(layout, remoteNode) {
     "if(!marker||marker.app!=='clawd-on-desk'||marker.integration!=='pi'||marker.managed!==true||!marker.remote)process.exit(3);",
     "for(const k of ['installId','profileId','runtimeKey','layoutVersion'])if(marker.remote[k]!==sourceIdentity[k])process.exit(4);",
     "if((fs.statSync(extensionIdentityPath).mode&0o077)!==0)process.exit(5);",
-    "for(const [target,source] of Object.entries(sourceFiles)){const a=fs.readFileSync(p.join(extensionDir,target)),b=fs.readFileSync(p.join(sourceDir,source));if(!a.equals(b))process.exit(6)}",
+    "if((fs.statSync(extensionDir).mode&0o077)!==0)process.exit(6);",
+    "for(const [target,source] of Object.entries(sourceFiles)){const a=fs.readFileSync(p.join(extensionDir,target)),b=fs.readFileSync(p.join(sourceDir,source));if(!a.equals(b))process.exit(7)}",
   ].join("");
   return buildRemoteNodeEvalCommand(remoteNode, script);
 }
