@@ -187,7 +187,7 @@ function createPetPresentationBridge(options = {}) {
   }
 
   function launchRenderer(payload, statusPath) {
-    if (!rendererBinary || launchedIds.has(payload.session_id) || payload.state === "closed") return;
+    if (!rendererBinary || launchedIds.has(payload.session_id) || payload.state === "closed" || payload.state === "offline") return;
     launchedIds.add(payload.session_id);
     const args = ["run", "--status-file", statusPath, "--session-id", payload.session_id];
     if (assetsDir) args.push("--assets-dir", assetsDir);
@@ -209,7 +209,16 @@ function createPetPresentationBridge(options = {}) {
           releaseLaunch();
           log(`renderer launch failed for ${payload.session_id}: ${error.message}`);
         });
-        child.once("exit", releaseLaunch);
+        // A clean exit (code 0, e.g. the pet's own idle watchdog or the user
+        // closing the window) means "leave it dead": onSnapshot only relaunches
+        // on a genuine presentation change. An abnormal exit is logged so crash
+        // loops are diagnosable; relaunch still waits for the next real event.
+        child.once("exit", (code, signal) => {
+          releaseLaunch();
+          if (code !== 0 || signal) {
+            log(`renderer for ${payload.session_id} exited abnormally: code=${code} signal=${signal || "none"}`);
+          }
+        });
       }
     } catch (error) {
       log(`renderer launch threw for ${payload.session_id}: ${error.message}`);
@@ -261,16 +270,24 @@ function createPetPresentationBridge(options = {}) {
       const payload = toStatusPayload(entry, now());
       const statusPath = statusPathFor(payload.session_id);
       const prior = known.get(payload.session_id);
-      if (presentationChanged(prior, payload)) {
+      const changed = presentationChanged(prior, payload);
+      if (changed) {
         writeStatusFile(statusPath, payload, fsApi);
         written += 1;
       }
       if (payload.state === "closed") launchedIds.delete(payload.session_id);
       seenIds.add(payload.session_id);
       known.set(payload.session_id, payload);
-      const wasLaunched = launchedIds.has(payload.session_id);
-      launchRenderer(payload, statusPath);
-      if (!wasLaunched && launchedIds.has(payload.session_id)) launched += 1;
+      // Launch (or relaunch) only on genuine presentation activity. A renderer
+      // that exited on its own — the pet's idle watchdog closing the window, or
+      // the user dismissing it — must stay dead through heartbeat/quota-driven
+      // rebroadcasts; the next real event brings it back.
+      const isRunning = launchedProcesses.has(payload.session_id);
+      if (changed && !isRunning && payload.state !== "closed" && payload.state !== "offline") {
+        const wasLaunched = launchedIds.has(payload.session_id);
+        launchRenderer(payload, statusPath);
+        if (!wasLaunched && launchedIds.has(payload.session_id)) launched += 1;
+      }
     }
     markMissingSessionsOffline(seenIds);
     return { written, launched };

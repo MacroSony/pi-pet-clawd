@@ -2,6 +2,7 @@
 
 const { describe, it, afterEach } = require("node:test");
 const assert = require("node:assert");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -133,6 +134,70 @@ describe("pet presentation bridge", () => {
     // Timestamp-only ripple (heartbeat bumping updatedAt) must not rewrite.
     const rippled = makeSession({ updatedAt: Date.UTC(2026, 8, 1, 0, 1, 0), lastEvent: { rawEvent: "PostToolUse", at: Date.UTC(2026, 8, 1, 0, 0, 2) } });
     assert.deepStrictEqual(bridge.onSnapshot({ sessions: [rippled] }), { written: 0, launched: 0 });
+  });
+
+  it("does not relaunch a voluntarily exited renderer on idle rebroadcasts", () => {
+    const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
+    temporaryDirs.push(statusDir);
+    const children = [];
+    const bridge = createPetPresentationBridge({
+      enabled: true,
+      statusDir,
+      rendererBinary: "/opt/claude-status-pet",
+      spawn: () => {
+        const child = new EventEmitter();
+        child.unref = () => {};
+        children.push(child);
+        return child;
+      },
+    });
+    const session = makeSession();
+
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 1, launched: 1 });
+    assert.strictEqual(children.length, 1);
+
+    // Pet's own watchdog closes the window → clean exit (code 0).
+    children[0].emit("exit", 0, null);
+
+    // Periodic presentation-identical rebroadcasts must not resurrect it.
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 0, launched: 0 });
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 0, launched: 0 });
+    assert.strictEqual(children.length, 1);
+
+    // A genuine new event relaunches the renderer.
+    const working = makeSession({
+      state: "working",
+      toolName: "bash",
+      lastEvent: { rawEvent: "PostToolUse", at: Date.UTC(2026, 8, 1, 0, 5, 0) },
+    });
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [working] }), { written: 1, launched: 1 });
+    assert.strictEqual(children.length, 2);
+  });
+
+  it("does not launch a renderer for offline sessions but relaunches on return", () => {
+    const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
+    temporaryDirs.push(statusDir);
+    const children = [];
+    const bridge = createPetPresentationBridge({
+      enabled: true,
+      statusDir,
+      rendererBinary: "/opt/claude-status-pet",
+      spawn: () => {
+        const child = new EventEmitter();
+        child.unref = () => {};
+        children.push(child);
+        return child;
+      },
+    });
+    const offline = makeSession({ state: "sleeping" }); // presentationState → offline
+    const result = bridge.onSnapshot({ sessions: [offline] });
+    assert.strictEqual(result.launched, 0);
+    assert.strictEqual(children.length, 0);
+
+    // Session comes back online → presentation change → relaunch.
+    const back = makeSession({ state: "idle" });
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [back] }), { written: 1, launched: 1 });
+    assert.strictEqual(children.length, 1);
   });
 
   it("marks a missing snapshot session offline instead of fabricating SessionEnd", () => {    const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
