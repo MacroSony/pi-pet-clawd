@@ -102,7 +102,10 @@ describe("pet presentation bridge", () => {
     const session = makeSession();
 
     assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 1, launched: 1 });
-    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 1, launched: 0 });
+    // Presentation-identical rebroadcasts (heartbeat ripples, quota freshness
+    // ticks) must not rewrite the status file: downstream file watchers treat
+    // every mtime bump as session activity.
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [session] }), { written: 0, launched: 0 });
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].binary, "/opt/claude-status-pet");
     assert.deepStrictEqual(calls[0].args.slice(0, 1), ["run"]);
@@ -116,8 +119,23 @@ describe("pet presentation bridge", () => {
     assert.strictEqual(payload.session_id, petId);
   });
 
-  it("marks a missing snapshot session offline instead of fabricating SessionEnd", () => {
+  it("rewrites when a real event lands even if state and tool are unchanged", () => {
     const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
+    temporaryDirs.push(statusDir);
+    const bridge = createPetPresentationBridge({ enabled: true, statusDir });
+    const pre = makeSession({ lastEvent: { rawEvent: "PreToolUse", at: Date.UTC(2026, 8, 1, 0, 0, 1) } });
+    const post = makeSession({ lastEvent: { rawEvent: "PostToolUse", at: Date.UTC(2026, 8, 1, 0, 0, 2) } });
+
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [pre] }), { written: 1, launched: 0 });
+    // Same state/detail/tool, but a new real event — must rewrite so the pet
+    // watchdog keeps seeing genuine activity.
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [post] }), { written: 1, launched: 0 });
+    // Timestamp-only ripple (heartbeat bumping updatedAt) must not rewrite.
+    const rippled = makeSession({ updatedAt: Date.UTC(2026, 8, 1, 0, 1, 0), lastEvent: { rawEvent: "PostToolUse", at: Date.UTC(2026, 8, 1, 0, 0, 2) } });
+    assert.deepStrictEqual(bridge.onSnapshot({ sessions: [rippled] }), { written: 0, launched: 0 });
+  });
+
+  it("marks a missing snapshot session offline instead of fabricating SessionEnd", () => {    const statusDir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-pet-bridge-"));
     temporaryDirs.push(statusDir);
     const bridge = createPetPresentationBridge({ enabled: true, statusDir });
     const session = makeSession();

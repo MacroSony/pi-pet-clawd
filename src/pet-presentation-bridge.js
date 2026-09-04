@@ -132,6 +132,22 @@ function toStatusPayload(entry, now = new Date()) {
   };
 }
 
+// Presentation fields that justify a status-file rewrite. Broadcasts also fire
+// for non-presentation reasons (quota freshness ticks, liveness ripples), and
+// every rewrite trips the pet's file watcher, which downstream consumers (e.g.
+// the pet's idle watchdog) read as session activity. `event` must stay in the
+// list: alternating PreToolUse/PostToolUse with identical state/tool is real
+// work and must keep refreshing the file.
+const PRESENTATION_COMPARE_KEYS = ["state", "detail", "tool", "event", "session_id", "session_name"];
+
+function presentationChanged(previous, next) {
+  if (!previous) return true;
+  for (const key of PRESENTATION_COMPARE_KEYS) {
+    if (previous[key] !== next[key]) return true;
+  }
+  return false;
+}
+
 function writeStatusFile(statusPath, payload, fsApi = fs) {
   fsApi.mkdirSync(path.dirname(statusPath), { recursive: true });
   const content = `${JSON.stringify(payload)}\n`;
@@ -244,11 +260,14 @@ function createPetPresentationBridge(options = {}) {
       if (!entry || entry.headless === true || !agentIds.has(entry.agentId)) continue;
       const payload = toStatusPayload(entry, now());
       const statusPath = statusPathFor(payload.session_id);
-      writeStatusFile(statusPath, payload, fsApi);
+      const prior = known.get(payload.session_id);
+      if (presentationChanged(prior, payload)) {
+        writeStatusFile(statusPath, payload, fsApi);
+        written += 1;
+      }
       if (payload.state === "closed") launchedIds.delete(payload.session_id);
       seenIds.add(payload.session_id);
       known.set(payload.session_id, payload);
-      written += 1;
       const wasLaunched = launchedIds.has(payload.session_id);
       launchRenderer(payload, statusPath);
       if (!wasLaunched && launchedIds.has(payload.session_id)) launched += 1;
