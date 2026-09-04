@@ -264,9 +264,16 @@ function attach(pi, deps = {}) {
     if (heartbeatTimer) return;
     heartbeatTimer = setIntervalFn(() => {
       const ctx = latestCtx;
-      if (!ctx || !contextIsIdle(ctx)) return;
+      if (!ctx) return;
+      // The heartbeat must also fire during active turns: a long-running tool
+      // call produces no hook events for many minutes, and without a liveness
+      // bump Clawd's stale sweep force-idles (then deletes) the session while
+      // the agent is genuinely working. livenessOnly keeps this cheap on the
+      // server (touchSessionActivity only bumps updatedAt) and the reported
+      // state mirrors the real lifecycle so a rehydrated session is not
+      // wrongly rewritten as idle mid-turn.
       send(
-        "idle",
+        contextIsIdle(ctx) ? "idle" : "working",
         "SessionHeartbeat",
         { type: "session_heartbeat" },
         ctx,

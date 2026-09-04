@@ -162,7 +162,7 @@ describe("pi-extension-core", () => {
     assert.strictEqual(posts[0].agent_pid, 999);
   });
 
-  it("heartbeats only while idle and treats extension reload as non-terminal", async () => {
+  it("heartbeats in idle and mid-turn, and treats extension reload as non-terminal", async () => {
     const handlers = {};
     let intervalCallback = null;
     let cleared = false;
@@ -195,6 +195,19 @@ describe("pi-extension-core", () => {
     assert.deepStrictEqual(posts.map((payload) => [payload.event, payload.liveness_only]), [
       ["SessionStart", undefined],
       ["SessionHeartbeat", true],
+    ]);
+
+    // Mid-turn (long-running tool call, no hook events for minutes): the
+    // heartbeat must still fire and report the working lifecycle state so
+    // Clawd's stale sweep never force-idles a genuinely busy session.
+    handlers.before_agent_start({ type: "before_agent_start" }, makeCtx({ isIdle: () => false }));
+    await Promise.resolve();
+    posts.length = 0;
+    intervalCallback();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepStrictEqual(posts.map((payload) => [payload.event, payload.state, payload.liveness_only]), [
+      ["SessionHeartbeat", "working", true],
     ]);
 
     const beforeReload = posts.length;

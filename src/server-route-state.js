@@ -447,10 +447,15 @@ function handleStatePost(req, res, options) {
           return;
         }
         // A heartbeat from an in-process interactive extension is enough to
-        // restore an idle row after Clawd itself restarted or the profile was
+        // restore a session row after Clawd itself restarted or the profile was
         // disconnected past its retention window. The canonical profile/raw
-        // identity computed above preserves the prior pet ID.
-        state = "idle";
+        // identity computed above preserves the prior pet ID. Keep the state
+        // the extension reported: a mid-turn heartbeat (long-running tool call)
+        // must not rehydrate the session as idle while work is in flight.
+        const reportedState = typeof data.state === "string" && data.state.trim()
+          ? data.state.trim().toLowerCase().slice(0, 80)
+          : "idle";
+        state = reportedState;
         event = "SessionStart";
       }
       if (agentId === "deepseek-harness") {

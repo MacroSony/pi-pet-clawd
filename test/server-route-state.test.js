@@ -213,7 +213,7 @@ describe("server-route-state POST", () => {
     assert.strictEqual(result.calls.updateSession.length, 0);
   });
 
-  it("rehydrates a missing Pi heartbeat as the same stable idle session", async () => {
+  it("rehydrates a missing Pi heartbeat with the reported lifecycle state", async () => {
     const result = await callStatePost(JSON.stringify({
       agent_id: "pi",
       hook_source: "pi-extension",
@@ -228,12 +228,35 @@ describe("server-route-state POST", () => {
 
     assert.strictEqual(result.statusCode, 200);
     assert.strictEqual(result.calls.updateSession.length, 1);
+    // Mid-turn heartbeats (long tool call across a Clawd restart) must not
+    // rehydrate the session as idle while work is in flight.
     assert.deepStrictEqual(result.calls.updateSession[0].slice(0, 3), [
       localSessionKey("pi:restored"),
-      "idle",
+      "working",
       "SessionStart",
     ]);
     assert.strictEqual(result.calls.updateSession[0][3].rawSessionId, "pi:restored");
+  });
+
+  it("rehydrates an idle Pi heartbeat as an idle session", async () => {
+    const result = await callStatePost(JSON.stringify({
+      agent_id: "pi",
+      hook_source: "pi-extension",
+      session_id: "pi:restored-idle",
+      event: "SessionHeartbeat",
+      state: "idle",
+      liveness_only: true,
+    }), {
+      ctx: { touchSessionActivity: () => false },
+    });
+
+    assert.strictEqual(result.statusCode, 200);
+    assert.strictEqual(result.calls.updateSession.length, 1);
+    assert.deepStrictEqual(result.calls.updateSession[0].slice(0, 3), [
+      localSessionKey("pi:restored-idle"),
+      "idle",
+      "SessionStart",
+    ]);
   });
 
   it("enforces DSH upstream sequence order across created, event, and disposed callbacks", async () => {
