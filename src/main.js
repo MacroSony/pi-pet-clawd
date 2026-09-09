@@ -183,6 +183,7 @@ const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
 const createPetPresentationBridge = require("./pet-presentation-bridge");
 const petPresentationBridgeEnabled = createPetPresentationBridge.isEnabledFromEnv(process.env);
+const petBridgeAgentIds = createPetPresentationBridge.agentIdsFromEnv(process.env);
 const petBridgeHidesNativePet = createPetPresentationBridge.shouldHideNativePetFromEnv(process.env);
 const { collectRequiredAssetFiles } = require("./theme-schema");
 const { describeGeometrySync } = require("./pet-accessory-state");
@@ -2130,6 +2131,7 @@ let notifyUpdaterSilentExit = () => {};
 // the same authoritative snapshot fan-out as Dashboard/HUD/notifications.
 const petPresentationBridge = createPetPresentationBridge({
   enabled: petPresentationBridgeEnabled,
+  agentIds: petBridgeAgentIds,
   statusDir: process.env.CLAWD_PET_BRIDGE_STATUS_DIR,
   rendererBinary: process.env.CLAWD_PET_BRIDGE_RENDERER_BIN,
   assetsDir: process.env.CLAWD_PET_BRIDGE_ASSETS_DIR,

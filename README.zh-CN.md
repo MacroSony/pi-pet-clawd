@@ -1,3 +1,11 @@
+> **Pi Pet integration fork** — This repository is the Clawd adapter used by
+> [MacroSony/pi-pet](https://github.com/MacroSony/pi-pet), not an official upstream release.
+> Start with the parent repository's recursive checkout and root launcher.
+> The bridge runtime lives in the parent repo; bridge-disabled Clawd remains standalone.
+> The upstream installation/release/update links below refer to
+> [rullerzhou-afk/clawd-on-desk](https://github.com/rullerzhou-afk/clawd-on-desk),
+> not to this integration. No Pi Pet binary release is provided here.
+
 <p align="center">
   <img src="assets/icon.png" width="128" alt="Clawd">
 </p>
