@@ -68,10 +68,12 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
       : "";
     const pathValue = extractPermissionPathNonce(req.url);
     const queryValue = extractPermissionQueryNonce(req.url);
-    const nonce = pathValue || queryValue || headerValue;
+    const isPetExpression = req.method === "POST" && req.url === "/pet-expression";
+    const nonce = isPetExpression ? headerValue : (pathValue || queryValue || headerValue);
     const allowedPath = (req.method === "GET" && req.url === "/state")
       || (req.method === "POST" && req.url === "/state")
-      || (req.method === "POST" && (req.url === "/permission" || !!pathValue || !!queryValue));
+      || (req.method === "POST" && (req.url === "/permission" || !!pathValue || !!queryValue))
+      || isPetExpression;
 
     if (!allowedPath || !timingSafeNonceMatch(nonce, acceptedNonces)) {
       counters.rejectedCount += 1;

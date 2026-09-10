@@ -47,6 +47,9 @@ const {
   shouldBypassCodexBubble,
   shouldBypassFamilyBubble,
 } = require("./server-route-permission");
+const {
+  handlePetExpressionPost,
+} = require("./server-route-pet-expression");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
   getCodexOfficialTurnKey,
@@ -753,6 +756,11 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         windowsProcessChainRuntime,
         resolveWindowsProcessMetadata,
         recordWindowsProcessChainShadow: ctx.recordWindowsProcessChainShadow,
+        remoteProfile,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-expression") {
+      handlePetExpressionPost(req, res, {
+        ctx,
         remoteProfile,
       });
     } else {
