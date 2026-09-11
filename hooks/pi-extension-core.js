@@ -11,6 +11,7 @@ const serverConfig = require("./server-config");
 
 const PI_AGENT_ID = "pi";
 const PI_HOOK_SOURCE = "pi-extension";
+const PEER_CAPABILITY_SLOT_SYMBOL = Symbol.for("pi-pet.peer-capability.v1");
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const INBOX_POLL_INTERVAL_MS = 1_000;
 const INBOX_RETRY_INTERVAL_MS = 1_000;
@@ -271,6 +272,18 @@ function buildPayload(options = {}) {
       version: 1,
       receiveUserMessage: true,
       token: options.capabilityToken,
+    };
+  }
+
+  if (
+    options.peerCapabilityToken
+    && isValidCapabilityToken(options.peerCapabilityToken)
+    && isStartableRawSessionId(payload.session_id)
+  ) {
+    payload.pet_peer_capability = {
+      version: 1,
+      receivePeerMessage: true,
+      token: options.peerCapabilityToken,
     };
   }
 
@@ -698,6 +711,20 @@ function attach(pi, deps = {}) {
     ? (isValidCapabilityToken(deps.capabilityToken) ? deps.capabilityToken : generateCapabilityToken())
     : null;
 
+  const peerCapabilityToken = isValidCapabilityToken(deps.peerCapabilityToken)
+    ? deps.peerCapabilityToken
+    : generateCapabilityToken();
+
+  const globalTarget = deps.globalObject || globalThis;
+  try {
+    globalTarget[PEER_CAPABILITY_SLOT_SYMBOL] = Object.freeze({
+      version: 1,
+      token: peerCapabilityToken,
+    });
+  } catch {
+    // Shared slot write failure fails closed silently
+  }
+
   const deliveryChains = new Map();
   let heartbeatTimer = null;
   let latestCtx = null;
@@ -721,6 +748,7 @@ function attach(pi, deps = {}) {
         ctx,
         ...sendOptions,
         ...(capabilityToken ? { capabilityToken } : {}),
+        ...(peerCapabilityToken ? { peerCapabilityToken } : {}),
       });
     } catch {
       return waitForDelivery ? Promise.resolve(false) : false;
@@ -880,6 +908,8 @@ function attach(pi, deps = {}) {
 
 const api = {
   DEFAULT_EVENT_BINDINGS,
+  PEER_CAPABILITY_SLOT_SYMBOL,
+  PEER_CAPABILITY_SLOT: PEER_CAPABILITY_SLOT_SYMBOL,
   PI_AGENT_ID,
   PI_HOOK_SOURCE,
   attach,
