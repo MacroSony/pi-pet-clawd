@@ -71,7 +71,14 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
     const isPetExpression = req.method === "POST" && req.url === "/pet-expression";
     const isPetInboxClaim = req.method === "POST" && req.url === "/pet-inbox/claim";
     const isPetInboxSettle = req.method === "POST" && req.url === "/pet-inbox/settle";
-    const nonce = (isPetExpression || isPetInboxClaim || isPetInboxSettle)
+    const isPetPeerEndpoint = req.method === "POST" && (
+      req.url === "/pet-peer/catalog"
+      || req.url === "/pet-peer/send"
+      || req.url === "/pet-peer/claim"
+      || req.url === "/pet-peer/settle"
+      || req.url === "/pet-peer/receipt"
+    );
+    const nonce = (isPetExpression || isPetInboxClaim || isPetInboxSettle || isPetPeerEndpoint)
       ? headerValue
       : (pathValue || queryValue || headerValue);
     const allowedPath = (req.method === "GET" && req.url === "/state")
@@ -79,7 +86,8 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
       || (req.method === "POST" && (req.url === "/permission" || !!pathValue || !!queryValue))
       || isPetExpression
       || isPetInboxClaim
-      || isPetInboxSettle;
+      || isPetInboxSettle
+      || isPetPeerEndpoint;
 
     if (!allowedPath || !timingSafeNonceMatch(nonce, acceptedNonces)) {
       counters.rejectedCount += 1;

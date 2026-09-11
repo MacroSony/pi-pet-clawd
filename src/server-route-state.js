@@ -409,18 +409,21 @@ function handleStatePost(req, res, options) {
         || (ctx && ctx.registerPetInboxCapability);
       const revokePetInboxCapability = options.revokePetInboxCapability
         || (ctx && ctx.revokePetInboxCapability);
+      const registerPetPeerCapability = options.registerPetPeerCapability
+        || (ctx && ctx.registerPetPeerCapability);
+      const revokePetPeerCapability = options.revokePetPeerCapability
+        || (ctx && ctx.revokePetPeerCapability);
+      const isPiExtension = agentId === "pi" && hookSource === "pi-extension";
       const isRemotePiExtension = !!remoteProfile
         && typeof remoteProfile.profileId === "string"
         && remoteProfile.profileId.length > 0
-        && agentId === "pi"
-        && hookSource === "pi-extension";
+        && isPiExtension;
       // Pi runs inside the interactive CLI, so a low-frequency idle heartbeat
       // is authoritative process liveness. Existing sessions are touched
       // without changing state/recent events; after a Clawd restart or a long
       // tunnel outage, the same heartbeat may rehydrate the stable session.
       const piLivenessOnly = data.liveness_only === true
-        && agentId === "pi"
-        && hookSource === "pi-extension";
+        && isPiExtension;
       // #406 completion-gate inputs from the Claude Stop hook. Counts / boolean
       // only — the hook never forwards task command or description text.
       const backgroundTasksCount = Number.isFinite(data.background_tasks_count)
@@ -465,6 +468,44 @@ function handleStatePost(req, res, options) {
             agentId: "pi",
             rawSessionId: sessionIdentity.rawSessionId,
             token: data.pet_inbox_capability.token,
+          });
+        }
+      }
+      if (isPiExtension) {
+        if (event === "SessionEnd") {
+          const revokeToken = (
+            data.pet_peer_capability
+            && typeof data.pet_peer_capability === "object"
+            && !Array.isArray(data.pet_peer_capability)
+            && data.pet_peer_capability.version === 1
+            && data.pet_peer_capability.receivePeerMessage === true
+            && typeof data.pet_peer_capability.token === "string"
+            && /^[0-9a-f]{64}$/.test(data.pet_peer_capability.token)
+          ) ? data.pet_peer_capability.token : null;
+
+          if (revokeToken && typeof revokePetPeerCapability === "function") {
+            revokePetPeerCapability({
+              profileId: trustedProfileId,
+              agentId: "pi",
+              rawSessionId: sessionIdentity.rawSessionId,
+              token: revokeToken,
+            });
+          }
+        } else if (
+          data.pet_peer_capability
+          && typeof data.pet_peer_capability === "object"
+          && !Array.isArray(data.pet_peer_capability)
+          && data.pet_peer_capability.version === 1
+          && data.pet_peer_capability.receivePeerMessage === true
+          && typeof data.pet_peer_capability.token === "string"
+          && /^[0-9a-f]{64}$/.test(data.pet_peer_capability.token)
+          && typeof registerPetPeerCapability === "function"
+        ) {
+          registerPetPeerCapability({
+            profileId: trustedProfileId,
+            agentId: "pi",
+            rawSessionId: sessionIdentity.rawSessionId,
+            token: data.pet_peer_capability.token,
           });
         }
       }

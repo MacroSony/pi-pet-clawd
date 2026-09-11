@@ -57,6 +57,16 @@ const {
   handlePetInboxReceiptPost,
   createPetInboxCapabilityRegistry,
 } = require("./server-route-pet-inbox");
+const {
+  handlePetPeerCatalogPost,
+  handlePetPeerSendPost,
+  handlePetPeerClaimPost,
+  handlePetPeerSettlePost,
+  handlePetPeerReceiptPost,
+  createPetPeerCapabilityRegistry,
+  createPetPeerHandleStore,
+  createPeerSendRateLimiter,
+} = require("./server-route-pet-peer");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
   getCodexOfficialTurnKey,
@@ -166,6 +176,9 @@ const codexOfficialTurns = new Map();
 const dshStateSequenceFence = createDshStateSequenceFence();
 const recentHookEvents = new Map();
 const petInboxCapabilityRegistry = ctx.petInboxCapabilityRegistry || createPetInboxCapabilityRegistry();
+const petPeerCapabilityRegistry = ctx.petPeerCapabilityRegistry || createPetPeerCapabilityRegistry();
+const petPeerHandleStore = ctx.petPeerHandleStore || createPetPeerHandleStore();
+const petPeerSendRateLimiter = ctx.petPeerSendRateLimiter || createPeerSendRateLimiter();
 
 function isClaudeStatuslineMetadataAllowed() {
   return ctx.claudeQuotaCollectionEnabled === true && !claudeStatuslineIngressSuppressed;
@@ -757,6 +770,8 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         isClaudeStatuslineMetadataAllowed,
         registerPetInboxCapability: petInboxCapabilityRegistry.registerCapability,
         revokePetInboxCapability: petInboxCapabilityRegistry.revokeCapability,
+        registerPetPeerCapability: petPeerCapabilityRegistry.registerCapability,
+        revokePetPeerCapability: petPeerCapabilityRegistry.revokeCapability,
       });
     } else if (req.method === "POST" && req.url === "/permission") {
       handlePermissionPost(req, res, {
@@ -794,6 +809,49 @@ function routeHttpRequest(req, res, remoteProfile = null) {
       handlePetInboxReceiptPost(req, res, {
         ctx,
         remoteProfile,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-peer/catalog") {
+      handlePetPeerCatalogPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-peer/send") {
+      handlePetPeerSendPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        peerSendRateLimiter: petPeerSendRateLimiter,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        enqueuePeerMessage: typeof ctx.enqueuePeerMessage === "function" ? ctx.enqueuePeerMessage : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-peer/claim") {
+      handlePetPeerClaimPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        claimNextPeerMessage: typeof ctx.claimNextPeerMessage === "function" ? ctx.claimNextPeerMessage : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-peer/settle") {
+      handlePetPeerSettlePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        settlePeerMessage: typeof ctx.settlePeerMessage === "function" ? ctx.settlePeerMessage : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-peer/receipt") {
+      handlePetPeerReceiptPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        getPeerMessageReceipt: typeof ctx.getPeerMessageReceipt === "function" ? ctx.getPeerMessageReceipt : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
     } else {
       res.writeHead(404);
@@ -920,6 +978,9 @@ function cleanup() {
   clearRuntimeConfigFn();
   clearClaudeHookGuardStatus();
   petInboxCapabilityRegistry.clear();
+  petPeerCapabilityRegistry.clear();
+  petPeerHandleStore.clear();
+  petPeerSendRateLimiter.clear();
   if (httpServer) httpServer.close();
 }
 
@@ -955,6 +1016,9 @@ return {
   startClaudeSettingsWatcher,
   stopClaudeSettingsWatcher,
   petInboxCapabilityRegistry,
+  petPeerCapabilityRegistry,
+  petPeerHandleStore,
+  petPeerSendRateLimiter,
   cleanup,
 };
 
