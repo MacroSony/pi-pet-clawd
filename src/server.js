@@ -50,6 +50,9 @@ const {
 const {
   handlePetExpressionPost,
 } = require("./server-route-pet-expression");
+const {
+  handlePetInboxPost,
+} = require("./server-route-pet-inbox");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
   getCodexOfficialTurnKey,
@@ -760,6 +763,11 @@ function routeHttpRequest(req, res, remoteProfile = null) {
       });
     } else if (req.method === "POST" && req.url === "/pet-expression") {
       handlePetExpressionPost(req, res, {
+        ctx,
+        remoteProfile,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-inbox") {
+      handlePetInboxPost(req, res, {
         ctx,
         remoteProfile,
       });
