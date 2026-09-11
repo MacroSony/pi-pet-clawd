@@ -52,6 +52,10 @@ const {
 } = require("./server-route-pet-expression");
 const {
   handlePetInboxPost,
+  handlePetInboxClaimPost,
+  handlePetInboxSettlePost,
+  handlePetInboxReceiptPost,
+  createPetInboxCapabilityRegistry,
 } = require("./server-route-pet-inbox");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
@@ -161,6 +165,7 @@ let claudeStatuslineIngressSuppressed = false;
 const codexOfficialTurns = new Map();
 const dshStateSequenceFence = createDshStateSequenceFence();
 const recentHookEvents = new Map();
+const petInboxCapabilityRegistry = ctx.petInboxCapabilityRegistry || createPetInboxCapabilityRegistry();
 
 function isClaudeStatuslineMetadataAllowed() {
   return ctx.claudeQuotaCollectionEnabled === true && !claudeStatuslineIngressSuppressed;
@@ -750,6 +755,8 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         recordWindowsProcessChainShadow: ctx.recordWindowsProcessChainShadow,
         remoteProfile,
         isClaudeStatuslineMetadataAllowed,
+        registerPetInboxCapability: petInboxCapabilityRegistry.registerCapability,
+        revokePetInboxCapability: petInboxCapabilityRegistry.revokeCapability,
       });
     } else if (req.method === "POST" && req.url === "/permission") {
       handlePermissionPost(req, res, {
@@ -768,6 +775,23 @@ function routeHttpRequest(req, res, remoteProfile = null) {
       });
     } else if (req.method === "POST" && req.url === "/pet-inbox") {
       handlePetInboxPost(req, res, {
+        ctx,
+        remoteProfile,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-inbox/claim") {
+      handlePetInboxClaimPost(req, res, {
+        ctx,
+        remoteProfile,
+        verifyPetInboxCapability: petInboxCapabilityRegistry.verifyCapability,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-inbox/settle") {
+      handlePetInboxSettlePost(req, res, {
+        ctx,
+        remoteProfile,
+        verifyPetInboxCapability: petInboxCapabilityRegistry.verifyCapability,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-inbox/receipt") {
+      handlePetInboxReceiptPost(req, res, {
         ctx,
         remoteProfile,
       });
@@ -895,6 +919,7 @@ function cleanup() {
   claudeHookOperations.dispose();
   clearRuntimeConfigFn();
   clearClaudeHookGuardStatus();
+  petInboxCapabilityRegistry.clear();
   if (httpServer) httpServer.close();
 }
 
@@ -929,6 +954,7 @@ return {
   stopIntegrationForAgent,
   startClaudeSettingsWatcher,
   stopClaudeSettingsWatcher,
+  petInboxCapabilityRegistry,
   cleanup,
 };
 

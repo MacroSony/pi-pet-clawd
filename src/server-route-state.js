@@ -405,6 +405,15 @@ function handleStatePost(req, res, options) {
       // around the full updateSession lifecycle machine.
       const metadataOnly = data.metadata_only === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
+      const registerPetInboxCapability = options.registerPetInboxCapability
+        || (ctx && ctx.registerPetInboxCapability);
+      const revokePetInboxCapability = options.revokePetInboxCapability
+        || (ctx && ctx.revokePetInboxCapability);
+      const isRemotePiExtension = !!remoteProfile
+        && typeof remoteProfile.profileId === "string"
+        && remoteProfile.profileId.length > 0
+        && agentId === "pi"
+        && hookSource === "pi-extension";
       // Pi runs inside the interactive CLI, so a low-frequency idle heartbeat
       // is authoritative process liveness. Existing sessions are touched
       // without changing state/recent events; after a Clawd restart or a long
@@ -433,6 +442,31 @@ function handleStatePost(req, res, options) {
         res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
         res.end();
         return;
+      }
+      if (isRemotePiExtension) {
+        if (event === "SessionEnd" && typeof revokePetInboxCapability === "function") {
+          revokePetInboxCapability({
+            profileId: remoteProfile.profileId,
+            agentId: "pi",
+            rawSessionId: sessionIdentity.rawSessionId,
+          });
+        } else if (
+          data.pet_inbox_capability
+          && typeof data.pet_inbox_capability === "object"
+          && !Array.isArray(data.pet_inbox_capability)
+          && data.pet_inbox_capability.version === 1
+          && data.pet_inbox_capability.receiveUserMessage === true
+          && typeof data.pet_inbox_capability.token === "string"
+          && /^[0-9a-f]{64}$/.test(data.pet_inbox_capability.token)
+          && typeof registerPetInboxCapability === "function"
+        ) {
+          registerPetInboxCapability({
+            profileId: remoteProfile.profileId,
+            agentId: "pi",
+            rawSessionId: sessionIdentity.rawSessionId,
+            token: data.pet_inbox_capability.token,
+          });
+        }
       }
       if (piLivenessOnly) {
         const touched = typeof ctx.touchSessionActivity === "function"
