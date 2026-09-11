@@ -224,18 +224,20 @@ function getProcessMetadata(): ProcessMetadata {
 export default function clawdPiExtension(pi: ExtensionAPI): void {
   core.attach(pi, {
     shouldReport: (ctx: ExtensionContext) => core.shouldReport(ctx),
-    buildPayload: ({ state, event, nativeEvent, ctx, livenessOnly }: {
+    buildPayload: ({ state, event, nativeEvent, ctx, livenessOnly, capabilityToken }: {
       state: string;
       event: string;
       nativeEvent: ExtensionEvent;
       ctx: ExtensionContext;
       livenessOnly?: boolean;
+      capabilityToken?: string;
     }) => core.buildPayload({
       state,
       event,
       nativeEvent,
       ctx,
       livenessOnly,
+      capabilityToken,
       metadata: getProcessMetadata(),
       agentPid: process.pid,
     }),

@@ -120,6 +120,32 @@ describe("pi-extension-core", () => {
     assert.strictEqual(payload.session_id, "pi:default");
   });
 
+  it("does not double-prefix when Pi sessionId already starts with pi:", () => {
+    const payload = core.buildPayload({
+      state: "idle",
+      event: "SessionStart",
+      ctx: makeCtx({ sessionManager: { getSessionId: () => "pi:custom-session" } }),
+    });
+
+    assert.strictEqual(payload.session_id, "pi:custom-session");
+  });
+
+  it("includes pet_inbox_capability when valid capabilityToken is provided", () => {
+    const token = "a".repeat(64);
+    const payload = core.buildPayload({
+      state: "idle",
+      event: "SessionStart",
+      ctx: makeCtx(),
+      capabilityToken: token,
+    });
+
+    assert.deepStrictEqual(payload.pet_inbox_capability, {
+      version: 1,
+      receiveUserMessage: true,
+      token,
+    });
+  });
+
   it("registers Pi lifecycle handlers and maps them to Clawd events", async () => {
     const handlers = {};
     const pi = {
