@@ -968,6 +968,24 @@ function startHttpServer() {
   });
 }
 
+function deactivatePetProfile(profileId) {
+  if (typeof profileId !== "string" || !profileId.trim() || profileId === "local") {
+    return {
+      inboxCapabilities: 0,
+      peerCapabilities: 0,
+      peerHandles: 0,
+      peerRateLimits: 0,
+    };
+  }
+
+  return {
+    inboxCapabilities: petInboxCapabilityRegistry.clearProfile(profileId),
+    peerCapabilities: petPeerCapabilityRegistry.clearProfile(profileId),
+    peerHandles: petPeerHandleStore.clearProfile(profileId),
+    peerRateLimits: petPeerSendRateLimiter.clearProfile(profileId),
+  };
+}
+
 function cleanup() {
   // Stop the supervisor before disposing the queue: a fs-watch event firing
   // during teardown must not enqueue new work onto a queue that is about to
@@ -1019,6 +1037,7 @@ return {
   petPeerCapabilityRegistry,
   petPeerHandleStore,
   petPeerSendRateLimiter,
+  deactivatePetProfile,
   cleanup,
 };
 

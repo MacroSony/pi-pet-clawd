@@ -3127,6 +3127,43 @@ function clearSessionsByAgent(agentId) {
   return removed;
 }
 
+function clearSessionsByProfile(profileId) {
+  if (typeof profileId !== "string" || !profileId.trim() || profileId === "local") return 0;
+
+  let removed = 0;
+  for (const [id, session] of sessions) {
+    if (!session || (session.profileId || "local") !== profileId) continue;
+
+    if (session.agentId === "codex") cancelCodexExitProbe(id, "profile-disconnected");
+    if (session.agentId === "kimi-cli") disposeKimiPermissionSession(id);
+
+    // Snapshot omission alone means only "not observed" to the presentation
+    // bridge. A profile disconnect is authoritative enough to close its pets;
+    // the next real heartbeat will recreate both session and renderer.
+    if (typeof ctx.onPresentationSessionEnd === "function") {
+      try {
+        ctx.onPresentationSessionEnd({
+          ...session,
+          id,
+          rawSessionId: session.rawSessionId || id,
+          profileId,
+          agentId: session.agentId,
+        });
+      } catch {}
+    }
+
+    deleteSessionWithCompletionCleanup(id, "profile-disconnected");
+    removed++;
+  }
+
+  if (removed > 0) {
+    const resolved = resolveDisplayState();
+    setState(resolved, getSvgOverride(resolved));
+    emitSessionSnapshot({ force: true });
+  }
+  return removed;
+}
+
 function detectRunningAgentProcesses(callback) {
   if (_detectInFlight) return;
   _detectInFlight = true;
@@ -3539,6 +3576,7 @@ return {
   promoteCompletion,
   ackSessionCompletion,
   clearSessionsByAgent,
+  clearSessionsByProfile,
   disposeAllKimiPermissionState,
   deriveSessionBadge,
   getCurrentState, getCurrentSvg, getCurrentHitBox, resolveHitBoxForSvg, getStartupRecoveryActive,

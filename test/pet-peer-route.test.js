@@ -180,6 +180,48 @@ describe("Capability Registry & Token Generation Lifecycle", () => {
     }), false);
   });
 
+  test("profile disconnect permits same-token reconnect with a fresh generation and invalidates related handles", () => {
+    const registry = createPetPeerCapabilityRegistry();
+    const store = createPetPeerHandleStore();
+    const localToken = generateToken();
+    const remoteToken = generateToken();
+    const local = { profileId: "local", agentId: "pi", rawSessionId: "local-session" };
+    const remote = { profileId: "profile-remote", agentId: "pi", rawSessionId: "remote-session" };
+
+    assert.equal(registry.registerCapability({ ...local, token: localToken }), true);
+    assert.equal(registry.registerCapability({ ...remote, token: remoteToken }), true);
+    const remoteGenerationBefore = registry.getGeneration(remote);
+
+    const incoming = store.createCatalogHandle({
+      caller: local,
+      callerGeneration: registry.getGeneration(local),
+      target: { ...remote, displayName: "Remote", host: "Homelab" },
+      targetGeneration: remoteGenerationBefore,
+    });
+    store.createCatalogHandle({
+      caller: remote,
+      callerGeneration: remoteGenerationBefore,
+      target: { ...local, displayName: "Local", host: "local" },
+      targetGeneration: registry.getGeneration(local),
+    });
+
+    assert.equal(registry.clearProfile("profile-remote"), 1);
+    assert.equal(registry.hasCapability(remote), false);
+    assert.equal(registry.hasCapability(local), true);
+    assert.equal(store.clearProfile("profile-remote"), 2);
+    assert.equal(store.size, 0);
+    assert.deepEqual(
+      store.resolveAndConsumeHandle(incoming.handle, { caller: local, registry }),
+      { ok: false, reason: "not_found" },
+    );
+
+    assert.equal(registry.registerCapability({ ...remote, token: remoteToken }), true);
+    assert.ok(registry.getGeneration(remote) > remoteGenerationBefore);
+    assert.equal(registry.verifyCapability({ ...remote, token: remoteToken }), true);
+    assert.equal(registry.clearProfile("local"), 0);
+    assert.equal(registry.hasCapability(local), true);
+  });
+
   test("capability lifecycle: A->B stale A rejected, stale A revoke fails, B revokes, stale B cannot resurrect, fresh C attaches", () => {
     const registry = createPetPeerCapabilityRegistry();
     const tokenA = generateToken();
@@ -686,6 +728,22 @@ describe("Peer Send Rate Limiter", () => {
     const checkAfter = rateLimiter.check(source, nowMs);
     assert.equal(checkAfter.allowed, true, "Sends should be allowed after 60s window rolls over");
     assert.equal(checkAfter.remaining, 10);
+  });
+
+  test("profile cleanup clears only that remote profile's limiter buckets", () => {
+    const rateLimiter = createPeerSendRateLimiter({ maxSends: 1 });
+    const remote = { profileId: "profile-remote", agentId: "pi", rawSessionId: "sender" };
+    const local = { profileId: "local", agentId: "pi", rawSessionId: "sender" };
+
+    rateLimiter.record(remote, 1000);
+    rateLimiter.record(local, 1000);
+    assert.equal(rateLimiter.check(remote, 1000).allowed, false);
+    assert.equal(rateLimiter.check(local, 1000).allowed, false);
+
+    assert.equal(rateLimiter.clearProfile("profile-remote"), 1);
+    assert.equal(rateLimiter.check(remote, 1000).allowed, true);
+    assert.equal(rateLimiter.check(local, 1000).allowed, false);
+    assert.equal(rateLimiter.clearProfile("local"), 0);
   });
 });
 

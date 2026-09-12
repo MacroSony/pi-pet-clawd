@@ -109,6 +109,26 @@ function createPetInboxCapabilityRegistry() {
     return timingSafeTokenMatch(token, expected);
   }
 
+  function clearProfile(profileId) {
+    if (
+      typeof profileId !== "string"
+      || !profileId.trim()
+      || profileId === "local"
+      || /[\0\r\n]/.test(profileId)
+    ) {
+      return 0;
+    }
+
+    const prefix = `${profileId}\0`;
+    let removed = 0;
+    for (const key of entries.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      entries.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+
   function clear() {
     entries.clear();
   }
@@ -117,6 +137,7 @@ function createPetInboxCapabilityRegistry() {
     registerCapability,
     revokeCapability,
     verifyCapability,
+    clearProfile,
     clear,
     get size() {
       return entries.size;

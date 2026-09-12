@@ -205,6 +205,42 @@ describe("remote profile session namespace", () => {
     assert.strictEqual(api.sessions.has(aId), false);
     assert.strictEqual(api.sessions.has(bId), true);
   });
+
+  it("clears one disconnected profile, closes its presentation pets, and preserves local and other remotes", () => {
+    const ended = [];
+    const snapshots = [];
+    api = require("../src/state")(makeCtx({
+      onPresentationSessionEnd: (session) => ended.push(session),
+      broadcastSessionSnapshot: (snapshot) => snapshots.push(snapshot),
+    }));
+
+    const remoteA1 = makeSessionKey({ profileId: "profile-a", rawSessionId: "remote-a-1" });
+    const remoteA2 = makeSessionKey({ profileId: "profile-a", rawSessionId: "remote-a-2" });
+    const remoteB = makeSessionKey({ profileId: "profile-b", rawSessionId: "remote-b" });
+    const local = makeSessionKey({ profileId: "local", rawSessionId: "local-session" });
+
+    update(api, { id: remoteA1, profileId: "profile-a", rawSessionId: "remote-a-1", agentId: "pi" });
+    update(api, { id: remoteA2, profileId: "profile-a", rawSessionId: "remote-a-2", agentId: "codex" });
+    update(api, { id: remoteB, profileId: "profile-b", rawSessionId: "remote-b", agentId: "pi" });
+    update(api, { id: local, profileId: "local", rawSessionId: "local-session", agentId: "pi" });
+    snapshots.length = 0;
+
+    assert.strictEqual(api.clearSessionsByProfile("profile-a"), 2);
+    assert.strictEqual(api.sessions.has(remoteA1), false);
+    assert.strictEqual(api.sessions.has(remoteA2), false);
+    assert.strictEqual(api.sessions.has(remoteB), true);
+    assert.strictEqual(api.sessions.has(local), true);
+    assert.deepStrictEqual(ended.map((entry) => entry.id).sort(), [remoteA1, remoteA2].sort());
+    assert.ok(snapshots.length > 0);
+    assert.deepStrictEqual(
+      snapshots.at(-1).sessions.map((entry) => entry.id).sort(),
+      [local, remoteB].sort(),
+    );
+
+    assert.strictEqual(api.clearSessionsByProfile("profile-a"), 0);
+    assert.strictEqual(api.clearSessionsByProfile("local"), 0);
+    assert.strictEqual(api.sessions.has(local), true);
+  });
 });
 
 /** Create a raw session object for direct Map insertion */

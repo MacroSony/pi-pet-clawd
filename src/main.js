@@ -4629,6 +4629,32 @@ _remoteSshRuntime = createRemoteSshRuntime({
   transportCoordinator: _remoteSshTransportCoordinator,
   log: (...args) => console.warn("Clawd remote-ssh:", ...args),
 });
+_remoteSshRuntime.on("status-changed", (snapshot) => {
+  const profileId = snapshot && snapshot.profileId;
+  if (
+    typeof profileId !== "string"
+    || !profileId.trim()
+    || profileId === "local"
+    || snapshot.status === "connected"
+  ) {
+    return;
+  }
+
+  // A non-connected SSH profile has no authenticated transport to its Pi
+  // sessions. Fail closed immediately: revoke messaging first, then remove
+  // the presentation/session directory. A later authentic /state heartbeat
+  // recreates both with a fresh peer capability generation.
+  try {
+    _server.deactivatePetProfile(profileId);
+  } catch (err) {
+    console.warn("Clawd remote-ssh: failed to deactivate pet capabilities:", err && err.message);
+  }
+  try {
+    _state.clearSessionsByProfile(profileId);
+  } catch (err) {
+    console.warn("Clawd remote-ssh: failed to clear disconnected profile sessions:", err && err.message);
+  }
+});
 const _remoteSshIpc = registerRemoteSshIpc({
   ipcMain,
   settingsController: _settingsController,

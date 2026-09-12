@@ -327,6 +327,24 @@ function createPetPeerCapabilityRegistry() {
     return Boolean(entry && entry.activeToken !== null);
   }
 
+  // A transport disconnect is not a Pi SessionEnd: the unchanged remote Pi
+  // process must be able to register its current attach token again after the
+  // tunnel returns. Delete the profile entries instead of retiring each token.
+  // nextGeneration deliberately remains monotonic, so handles minted before
+  // disconnect can never become valid again after re-registration.
+  function clearProfile(profileId) {
+    if (!isValidSessionProfileId(profileId) || profileId === "local") return 0;
+
+    const prefix = `${profileId}\0`;
+    let removed = 0;
+    for (const key of entries.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      entries.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+
   function clear() {
     entries.clear();
   }
@@ -337,6 +355,7 @@ function createPetPeerCapabilityRegistry() {
     verifyCapability,
     getGeneration,
     hasCapability,
+    clearProfile,
     clear,
     get size() {
       let count = 0;
@@ -488,6 +507,18 @@ function createPetPeerHandleStore(options = {}) {
     }
   }
 
+  function clearProfile(profileId) {
+    if (!isValidSessionProfileId(profileId) || profileId === "local") return 0;
+
+    let removed = 0;
+    for (const [handleId, entry] of handles) {
+      if (entry.caller.profileId !== profileId && entry.target.profileId !== profileId) continue;
+      handles.delete(handleId);
+      removed++;
+    }
+    return removed;
+  }
+
   function clear() {
     handles.clear();
   }
@@ -497,6 +528,7 @@ function createPetPeerHandleStore(options = {}) {
     createReplyHandle,
     resolveAndConsumeHandle,
     pruneExpired,
+    clearProfile,
     clear,
     get size() {
       return handles.size;
@@ -558,6 +590,19 @@ function createPeerSendRateLimiter(options = {}) {
     records.set(key, active);
   }
 
+  function clearProfile(profileId) {
+    if (!isValidSessionProfileId(profileId) || profileId === "local") return 0;
+
+    const prefix = `${profileId}\0`;
+    let removed = 0;
+    for (const key of records.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      records.delete(key);
+      removed++;
+    }
+    return removed;
+  }
+
   function clear() {
     records.clear();
   }
@@ -565,6 +610,7 @@ function createPeerSendRateLimiter(options = {}) {
   return {
     check,
     record,
+    clearProfile,
     clear,
   };
 }

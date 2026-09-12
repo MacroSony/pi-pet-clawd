@@ -404,6 +404,25 @@ describe("Capability Registry & State Route Registration Lifecycle", () => {
     }), false);
   });
 
+  test("profile disconnect clears only remote capabilities and allows unchanged process token to re-register", () => {
+    const registry = createPetInboxCapabilityRegistry();
+    const localToken = generateToken();
+    const remoteToken = generateToken();
+    const local = { profileId: "local", agentId: "pi", rawSessionId: "local-session" };
+    const remote = { profileId: "profile-remote", agentId: "pi", rawSessionId: "remote-session" };
+
+    assert.equal(registry.registerCapability({ ...local, token: localToken }), true);
+    assert.equal(registry.registerCapability({ ...remote, token: remoteToken }), true);
+    assert.equal(registry.clearProfile("profile-remote"), 1);
+    assert.equal(registry.verifyCapability({ ...remote, token: remoteToken }), false);
+    assert.equal(registry.verifyCapability({ ...local, token: localToken }), true);
+
+    assert.equal(registry.registerCapability({ ...remote, token: remoteToken }), true);
+    assert.equal(registry.verifyCapability({ ...remote, token: remoteToken }), true);
+    assert.equal(registry.clearProfile("local"), 0);
+    assert.equal(registry.verifyCapability({ ...local, token: localToken }), true);
+  });
+
   test("registry exposes size getter for tests/diagnostics without leaking tokens or entries", () => {
     const registry = createPetInboxCapabilityRegistry();
     assert.equal(registry.size, 0);

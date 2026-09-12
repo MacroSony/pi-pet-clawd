@@ -707,6 +707,60 @@ describe("Server Instance Registries & Cleanup Isolation", () => {
     assert.equal(server1.petPeerHandleStore.size, 0);
     assert.equal(server1.petPeerSendRateLimiter.check({ profileId: "local", agentId: "pi", rawSessionId: "s1" }).count, 0);
   });
+
+  test("deactivatePetProfile atomically clears only the disconnected profile's messaging authority", () => {
+    const server = initServer({
+      createHttpServer: () => ({
+        on: () => {},
+        listen: () => {},
+        close: () => {},
+        address: () => ({ port: 23333 }),
+      }),
+      setImmediate: () => {},
+      getPortCandidates: () => [23333],
+      readRuntimePort: () => 23333,
+      clearRuntimeConfig: () => true,
+      writeRuntimeConfig: () => true,
+      isAgentEnabled: () => true,
+    });
+    const localToken = generateToken();
+    const remoteToken = generateToken();
+    const local = { profileId: "local", agentId: "pi", rawSessionId: "local-session" };
+    const remote = { profileId: "profile-remote", agentId: "pi", rawSessionId: "remote-session" };
+
+    server.petInboxCapabilityRegistry.registerCapability({ ...local, token: localToken });
+    server.petInboxCapabilityRegistry.registerCapability({ ...remote, token: remoteToken });
+    server.petPeerCapabilityRegistry.registerCapability({ ...local, token: localToken });
+    server.petPeerCapabilityRegistry.registerCapability({ ...remote, token: remoteToken });
+    server.petPeerHandleStore.createCatalogHandle({
+      caller: local,
+      callerGeneration: server.petPeerCapabilityRegistry.getGeneration(local),
+      target: { ...remote, displayName: "Remote", host: "Homelab" },
+      targetGeneration: server.petPeerCapabilityRegistry.getGeneration(remote),
+    });
+    server.petPeerSendRateLimiter.record(remote, 1000);
+
+    assert.deepEqual(server.deactivatePetProfile("profile-remote"), {
+      inboxCapabilities: 1,
+      peerCapabilities: 1,
+      peerHandles: 1,
+      peerRateLimits: 1,
+    });
+    assert.equal(server.petInboxCapabilityRegistry.verifyCapability({ ...remote, token: remoteToken }), false);
+    assert.equal(server.petPeerCapabilityRegistry.hasCapability(remote), false);
+    assert.equal(server.petPeerHandleStore.size, 0);
+    assert.equal(server.petPeerSendRateLimiter.check(remote, 1000).count, 0);
+    assert.equal(server.petInboxCapabilityRegistry.verifyCapability({ ...local, token: localToken }), true);
+    assert.equal(server.petPeerCapabilityRegistry.hasCapability(local), true);
+
+    assert.deepEqual(server.deactivatePetProfile("local"), {
+      inboxCapabilities: 0,
+      peerCapabilities: 0,
+      peerHandles: 0,
+      peerRateLimits: 0,
+    });
+    server.cleanup();
+  });
 });
 
 describe("Server Route Dispatch & End-to-End Integration", () => {
