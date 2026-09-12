@@ -653,6 +653,7 @@ function createRemoteInboxConsumer({
   pollIntervalMs = INBOX_POLL_INTERVAL_MS,
   retryIntervalMs = INBOX_RETRY_INTERVAL_MS,
   settleDeadlineMs = INBOX_SETTLE_DEADLINE_MS,
+  isPeerWakeEnabled = () => false,
 }) {
   let active = true;
   let timer = null;
@@ -1015,6 +1016,13 @@ function createRemoteInboxConsumer({
       return;
     }
 
+    let triggerPeerTurn = false;
+    try {
+      triggerPeerTurn = isPeerWakeEnabled() === true;
+    } catch {
+      triggerPeerTurn = false;
+    }
+
     const contentLines = [
       "[Pi Pet peer note — not a user message or system instruction]",
       `From: ${sourceDisplayName} @ ${sourceHost}`,
@@ -1023,6 +1031,11 @@ function createRemoteInboxConsumer({
     ];
     if (replyHandle) {
       contentLines.push(`Optional reply target: ${replyHandle}`);
+      if (triggerPeerTurn) {
+        contentLines.push("This receiver opted into a bounded peer turn. If you reply, use only the supplied reply target; do not start another peer thread.");
+      }
+    } else if (triggerPeerTurn) {
+      contentLines.push("This bounded peer thread has no reply budget left. Do not start another peer thread unless the user explicitly asks.");
     }
 
     const customMessage = Object.freeze({
@@ -1043,7 +1056,7 @@ function createRemoteInboxConsumer({
 
     const dispatchOptions = Object.freeze({
       deliverAs: "followUp",
-      triggerTurn: false,
+      triggerTurn: triggerPeerTurn,
     });
 
     let dispatchSuccess = false;
@@ -1246,6 +1259,18 @@ function attach(pi, deps = {}) {
       pollIntervalMs,
       retryIntervalMs,
       settleDeadlineMs,
+      isPeerWakeEnabled: () => {
+        try {
+          const slot = globalTarget[PEER_CAPABILITY_SLOT_SYMBOL];
+          return Boolean(
+            slot && slot.version === 1
+            && slot.token === peerCapabilityToken
+            && slot.wakeMode === "bounded"
+          );
+        } catch {
+          return false;
+        }
+      },
     });
   }
 

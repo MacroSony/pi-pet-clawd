@@ -1170,6 +1170,160 @@ describe("Pi Remote Peer Consumer", () => {
     assert.equal(JSON.stringify(attach2).includes(token2), false);
   });
 
+  it("reads bounded wake mode dynamically from the shared capability slot for remote delivery", async () => {
+    const handlers = {};
+    const scheduled = [];
+    const sentMessages = [];
+    const globalObject = {};
+    const peerToken = "77".repeat(32);
+    const fixedNow = 1757419200000;
+    const pi = {
+      on(name, handler) { handlers[name] = handler; },
+      sendUserMessage() { throw new Error("peer message must not use sendUserMessage"); },
+      sendMessage(message, options) { sentMessages.push({ message, options }); },
+    };
+
+    const attached = core.attach(pi, {
+      globalObject,
+      remoteIdentity: makeRemoteIdentity(),
+      capabilityToken: "66".repeat(32),
+      peerCapabilityToken: peerToken,
+      shouldReport: () => true,
+      postState: async () => true,
+      now: () => fixedNow,
+      setInterval: () => ({ unref() {} }),
+      clearInterval: () => {},
+      setTimeout: (fn, ms) => {
+        const timer = { fn, ms, unref() {} };
+        scheduled.push(timer);
+        return timer;
+      },
+      clearTimeout: () => {},
+      httpRequest: createMockHttp((options) => {
+        if (options.path === "/pet-inbox/claim") {
+          return { statusCode: 200, body: { status: "empty" } };
+        }
+        if (options.path === "/pet-peer/claim") {
+          return {
+            statusCode: 200,
+            body: {
+              schemaVersion: "1",
+              kind: "peer_message",
+              status: "claimed",
+              messageId: "msg-remote-wake",
+              sourceDisplayName: "Windows Agent · Pi",
+              sourceHost: "Windows",
+              text: "Review the PoC result.",
+              deliverAs: "followUp",
+              threadId: "thr-remote-wake",
+              hopCount: 1,
+              maxHops: 1,
+              replyHandle: null,
+              createdAtMs: fixedNow - 1000,
+              expiresAtMs: fixedNow + 30000,
+              claimToken: "claim-remote-wake",
+              claimedAtMs: fixedNow,
+            },
+          };
+        }
+        if (options.path === "/pet-peer/settle") {
+          return { statusCode: 200, body: { status: "dispatched" } };
+        }
+        throw new Error(`unexpected path: ${options.path}`);
+      }),
+    });
+
+    handlers.session_start({ type: "session_start" }, makeCtx({
+      sessionManager: { getSessionId: () => "sess-remote-wake" },
+    }));
+    assert.deepEqual(globalObject[core.PEER_CAPABILITY_SLOT], {
+      version: 1,
+      token: peerToken,
+    });
+
+    // The root pi-pet extension replaces this frozen process-local slot when
+    // the user runs /pet-peer-wake on. The remote consumer reads it at dispatch,
+    // not only at attach time.
+    globalObject[core.PEER_CAPABILITY_SLOT] = Object.freeze({
+      version: 1,
+      token: peerToken,
+      wakeMode: "bounded",
+    });
+    await scheduled.shift().fn();
+
+    assert.equal(sentMessages.length, 1);
+    assert.deepEqual(sentMessages[0].options, {
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+    assert.match(sentMessages[0].message.content, /no reply budget left/);
+    assert.equal(sentMessages[0].message.details.replyHandle, null);
+
+    attached.stopHeartbeat();
+    if (attached.getInboxConsumer()) attached.getInboxConsumer().stop();
+  });
+
+  it("remote bounded wake on hop 0 preserves the single reply handle and guidance", async () => {
+    const scheduled = [];
+    const sentMessages = [];
+    const fixedNow = 1757419200000;
+    const consumer = core.createRemoteInboxConsumer({
+      pi: {
+        sendUserMessage() { throw new Error("peer message must not use sendUserMessage"); },
+        sendMessage(message, options) { sentMessages.push({ message, options }); },
+      },
+      identity: makeRemoteIdentity(),
+      rawSessionId: "pi:sess-remote-wake-hop0",
+      capabilityToken: "88".repeat(32),
+      peerCapabilityToken: "99".repeat(32),
+      now: () => fixedNow,
+      isPeerWakeEnabled: () => true,
+      setTimeout: (fn, ms) => {
+        const timer = { fn, ms, unref() {} };
+        scheduled.push(timer);
+        return timer;
+      },
+      clearTimeout: () => {},
+      httpRequest: createMockHttp((options) => {
+        if (options.path === "/pet-inbox/claim") return { statusCode: 200, body: { status: "empty" } };
+        if (options.path === "/pet-peer/claim") {
+          return {
+            statusCode: 200,
+            body: {
+              schemaVersion: "1",
+              kind: "peer_message",
+              status: "claimed",
+              messageId: "msg-remote-wake-hop0",
+              sourceDisplayName: "Homelab Agent · Pi",
+              sourceHost: "Homelab",
+              text: "Please validate this result.",
+              deliverAs: "followUp",
+              threadId: "thr-remote-wake-hop0",
+              hopCount: 0,
+              maxHops: 1,
+              replyHandle: "psh_remote_reply_once",
+              createdAtMs: fixedNow - 1000,
+              expiresAtMs: fixedNow + 30000,
+              claimToken: "claim-remote-wake-hop0",
+              claimedAtMs: fixedNow,
+            },
+          };
+        }
+        if (options.path === "/pet-peer/settle") return { statusCode: 200, body: { status: "dispatched" } };
+        throw new Error(`unexpected path: ${options.path}`);
+      }),
+    });
+
+    await scheduled.shift().fn();
+
+    assert.equal(sentMessages.length, 1);
+    assert.deepEqual(sentMessages[0].options, { deliverAs: "followUp", triggerTurn: true });
+    assert.match(sentMessages[0].message.content, /Optional reply target: psh_remote_reply_once/);
+    assert.match(sentMessages[0].message.content, /use only the supplied reply target/);
+    assert.equal(sentMessages[0].message.details.replyHandle, "psh_remote_reply_once");
+    consumer.stop();
+  });
+
   it("fails closed on bad server header and oversize response on peer endpoints", async () => {
     const identity = makeRemoteIdentity();
 
