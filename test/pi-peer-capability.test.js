@@ -2,6 +2,8 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const core = require("../hooks/pi-extension-core");
 
@@ -32,6 +34,24 @@ function makeRemoteIdentity(overrides = {}) {
 }
 
 describe("Pi Peer Capability Producer and Shared Slot", () => {
+  it("production TypeScript wrapper forwards peerCapabilityToken into core payloads", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "hooks", "pi-extension.ts"), "utf8");
+    const adapterStart = source.indexOf("    buildPayload:");
+    const adapterEnd = source.indexOf("    postState:", adapterStart);
+
+    assert.notEqual(adapterStart, -1, "production wrapper must define the buildPayload adapter");
+    assert.notEqual(adapterEnd, -1, "production wrapper buildPayload adapter must have a bounded source block");
+
+    const adapterSource = source.slice(adapterStart, adapterEnd);
+    assert.equal(
+      (adapterSource.match(/\bpeerCapabilityToken\b/g) || []).length,
+      3,
+      "wrapper must destructure, type, and forward peerCapabilityToken"
+    );
+    assert.match(adapterSource, /peerCapabilityToken\?:\s*string;/);
+    assert.match(adapterSource, /core\.buildPayload\(\{[\s\S]*\bpeerCapabilityToken,[\s\S]*\}\)/);
+  });
+
   it("local SessionStart advertises exact injected token", async () => {
     const handlers = {};
     const pi = {
