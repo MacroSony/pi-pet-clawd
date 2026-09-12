@@ -169,8 +169,17 @@ describe("pi-install", () => {
     const installedIdentityPath = path.join(result.extensionDir, REMOTE_IDENTITY_FILE);
     assert.strictEqual(result.installed, true);
     assert.deepStrictEqual(JSON.parse(fs.readFileSync(installedIdentityPath, "utf8")), identity);
-    assert.strictEqual(fs.statSync(installedIdentityPath).mode & 0o777, 0o600);
-    assert.strictEqual(fs.statSync(result.extensionDir).mode & 0o777, 0o700);
+    // Windows reports inherited ACL-backed files as 0666 even after chmod(0600);
+    // Unix mode bits are only a meaningful security assertion on POSIX.
+    if (process.platform !== "win32") {
+      assert.strictEqual(fs.statSync(installedIdentityPath).mode & 0o777, 0o600);
+      assert.strictEqual(fs.statSync(result.extensionDir).mode & 0o777, 0o700);
+    }
+    assert.strictEqual(
+      fs.readdirSync(result.extensionDir).some((name) => name.startsWith(`.${REMOTE_IDENTITY_FILE}.`) && name.endsWith(".tmp")),
+      false,
+      "atomic remote identity installation must not leave temporary files"
+    );
     assert.deepStrictEqual(
       JSON.parse(fs.readFileSync(path.join(result.extensionDir, MARKER_FILE), "utf8")).remote,
       {
