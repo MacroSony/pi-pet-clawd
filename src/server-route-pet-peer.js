@@ -902,14 +902,21 @@ function handlePetPeerCatalogPost(req, res, options = {}) {
           candidateSessions = snapshot;
         } else if (snapshot instanceof Map) {
           candidateSessions = Array.from(snapshot.values());
+        } else {
+          sendJsonResponse(res, 500, { status: "failed", reason: "invalid session snapshot" });
+          return;
         }
       } catch {
-        candidateSessions = [];
+        sendJsonResponse(res, 500, { status: "failed", reason: "failed to retrieve session snapshot" });
+        return;
       }
     } else if (Array.isArray(options.sessions)) {
       candidateSessions = options.sessions;
     } else if (ctx && Array.isArray(ctx.sessions)) {
       candidateSessions = ctx.sessions;
+    } else {
+      sendJsonResponse(res, 503, { status: "failed", reason: "session snapshot unavailable" });
+      return;
     }
 
     const results = [];

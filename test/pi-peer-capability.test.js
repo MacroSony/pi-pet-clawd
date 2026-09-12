@@ -34,6 +34,22 @@ function makeRemoteIdentity(overrides = {}) {
 }
 
 describe("Pi Peer Capability Producer and Shared Slot", () => {
+  it("production Electron server context exposes the real derived session snapshot", () => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "src", "main.js"), "utf8");
+    const contextStart = source.indexOf("const _serverCtx = {");
+    const contextEnd = source.indexOf("const _server = require(\"./server\")(_serverCtx);", contextStart);
+
+    assert.notEqual(contextStart, -1, "production main must define _serverCtx");
+    assert.notEqual(contextEnd, -1, "production _serverCtx must have a bounded source block");
+
+    const contextSource = source.slice(contextStart, contextEnd);
+    assert.match(
+      contextSource,
+      /getSessionSnapshot:\s*\(\)\s*=>\s*_state\.buildSessionSnapshot\(\)/,
+      "peer routes must receive the same derived session snapshot as Dashboard and HUD"
+    );
+  });
+
   it("production TypeScript wrapper forwards peerCapabilityToken into core payloads", () => {
     const source = fs.readFileSync(path.join(__dirname, "..", "hooks", "pi-extension.ts"), "utf8");
     const adapterStart = source.indexOf("    buildPayload:");

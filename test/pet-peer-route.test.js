@@ -860,6 +860,56 @@ describe("Catalog Route (POST /pet-peer/catalog)", () => {
     assert.ok(displayNames.includes("Active Desk · Pi"));
   });
 
+  test("fails closed instead of returning a misleading empty catalog when the snapshot is unavailable", async () => {
+    const cases = [
+      {
+        label: "missing provider",
+        expectedStatus: 503,
+        expectedReason: "session snapshot unavailable",
+      },
+      {
+        label: "throwing provider",
+        getSessionSnapshot: () => { throw new Error("snapshot failed"); },
+        expectedStatus: 500,
+        expectedReason: "failed to retrieve session snapshot",
+      },
+      {
+        label: "invalid provider result",
+        getSessionSnapshot: () => null,
+        expectedStatus: 500,
+        expectedReason: "invalid session snapshot",
+      },
+    ];
+
+    for (const fixture of cases) {
+      const { registry, handleStore } = setupCatalogFixtures();
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-peer/catalog",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "peer_catalog_query",
+          rawSessionId: "caller-sess",
+          capabilityToken: tokenCaller,
+        }),
+      });
+
+      handlePetPeerCatalogPost(req, res, {
+        remoteProfile: null,
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        ...(fixture.getSessionSnapshot ? { getSessionSnapshot: fixture.getSessionSnapshot } : {}),
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, fixture.expectedStatus, fixture.label);
+      const parsed = JSON.parse(result.body);
+      assert.equal(parsed.status, "failed", fixture.label);
+      assert.equal(parsed.reason, fixture.expectedReason, fixture.label);
+      assert.equal(parsed.sessions, undefined, fixture.label);
+    }
+  });
+
   test("applies state and host filters on sanitized projections", async () => {
     const { registry, handleStore, mockSnapshot } = setupCatalogFixtures();
 

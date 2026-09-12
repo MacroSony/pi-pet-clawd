@@ -2786,6 +2786,10 @@ const _serverCtx = {
   get PASSTHROUGH_TOOLS() { return PASSTHROUGH_TOOLS; },
   get STATE_SVGS() { return _state.STATE_SVGS; },
   get sessions() { return sessions; },
+  // Peer discovery and send authorization must use the same derived session
+  // snapshot as Dashboard/HUD so headless, recovered, hidden, and inactive
+  // sessions are evaluated consistently. Do not fall back to the raw Map.
+  getSessionSnapshot: () => _state.buildSessionSnapshot(),
   getCustomAgentIds: () => (_settingsController.get("customApplications") || [])
     .map((application) => application && application.id)
     .filter(Boolean),
