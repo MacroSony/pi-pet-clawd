@@ -67,6 +67,11 @@ const {
   createPetPeerHandleStore,
   createPeerSendRateLimiter,
 } = require("./server-route-pet-peer");
+const {
+  handlePetTeamStatusPost,
+  handlePetTeamCreatePost,
+  handlePetTeamDissolvePost,
+} = require("./server-route-pet-team");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
   getCodexOfficialTurnKey,
@@ -851,6 +856,36 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         remoteProfile,
         peerCapabilityRegistry: petPeerCapabilityRegistry,
         getPeerMessageReceipt: typeof ctx.getPeerMessageReceipt === "function" ? ctx.getPeerMessageReceipt : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/status") {
+      handlePetTeamStatusPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/create") {
+      handlePetTeamCreatePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/dissolve") {
+      handlePetTeamDissolvePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
         derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
     } else {

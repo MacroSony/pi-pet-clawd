@@ -444,7 +444,7 @@ function createPetPeerHandleStore(options = {}) {
     return { handle, expiresAtMs };
   }
 
-  function resolveAndConsumeHandle(handleId, { caller, registry, nowMs } = {}) {
+  function resolveAndConsumeHandle(handleId, { caller, registry, nowMs, expectedType } = {}) {
     if (typeof handleId !== "string" || !/^psh_[A-Za-z0-9_-]{1,124}$/.test(handleId)) {
       return { ok: false, reason: "invalid_handle" };
     }
@@ -460,6 +460,13 @@ function createPetPeerHandleStore(options = {}) {
     if (currentNow >= entry.expiresAtMs) {
       handles.delete(handleId);
       return { ok: false, reason: "expired" };
+    }
+
+    // Purpose-check before consuming. A handle presented to the wrong feature
+    // must not destroy the caller's valid one-shot capability for its original
+    // purpose (for example, a reply handle accidentally passed to Team create).
+    if (expectedType !== undefined && entry.type !== expectedType) {
+      return { ok: false, reason: "purpose_mismatch" };
     }
 
     // Check caller match (exact profileId, agentId='pi', rawSessionId)
