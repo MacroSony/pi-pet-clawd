@@ -2790,6 +2790,16 @@ const _serverCtx = {
   // snapshot as Dashboard/HUD so headless, recovered, hidden, and inactive
   // sessions are evaluated consistently. Do not fall back to the raw Map.
   getSessionSnapshot: () => _state.buildSessionSnapshot(),
+  // Team create/dissolve and Board writes do not change ordinary agent state,
+  // so explicitly refresh the opt-in presentation bridge instead of waiting
+  // for the next harness heartbeat. This is presentation-only and grants no
+  // Team, Board, wake, or messaging authority.
+  onTeamPresentationChanged: () => {
+    if (!petPresentationBridge.enabled) return;
+    try { petPresentationBridge.onSnapshot(_state.buildSessionSnapshot()); } catch (error) {
+      sessionLog(`[pet-bridge] Team presentation refresh failed: ${error && error.message}`);
+    }
+  },
   getCustomAgentIds: () => (_settingsController.get("customApplications") || [])
     .map((application) => application && application.id)
     .filter(Boolean),

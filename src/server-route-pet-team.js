@@ -507,6 +507,13 @@ function handlePetTeamStatusPost(req, res, options = {}) {
   });
 }
 
+function notifyTeamPresentationChanged(options) {
+  const notify = options.onTeamPresentationChanged
+    || (options.ctx && options.ctx.onTeamPresentationChanged);
+  if (typeof notify !== "function") return;
+  try { notify(); } catch {}
+}
+
 function handlePetTeamCreatePost(req, res, options = {}) {
   readJsonBody(req, res, validatePetTeamCreatePayload, (data) => {
     const auth = authenticateTeamRequest(req, res, options, data);
@@ -642,6 +649,7 @@ function handlePetTeamCreatePost(req, res, options = {}) {
       options,
     });
 
+    notifyTeamPresentationChanged(options);
     sendJsonResponse(res, 200, {
       schemaVersion: "1",
       kind: "team_create",
@@ -697,6 +705,7 @@ function handlePetTeamDissolvePost(req, res, options = {}) {
       return;
     }
 
+    notifyTeamPresentationChanged(options);
     sendJsonResponse(res, 200, {
       schemaVersion: "1",
       kind: "team_dissolve",
@@ -878,6 +887,7 @@ function handlePetTeamBoardWritePost(req, res, options = {}) {
       derivePetId,
     });
 
+    notifyTeamPresentationChanged(options);
     sendJsonResponse(res, 200, {
       schemaVersion: "1",
       kind: "team_board_write",
@@ -904,6 +914,7 @@ module.exports = {
   validatePetTeamDissolvePayload,
   validatePetTeamBoardReadPayload,
   validatePetTeamBoardWritePayload,
+  notifyTeamPresentationChanged,
   buildSanitizedTeamProjection,
   buildSanitizedBoardProjection,
   handlePetTeamStatusPost,

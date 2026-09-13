@@ -303,6 +303,7 @@ describe("Pet Team Route Execution & Lifecycle", () => {
   });
 
   test("create team happy path: resolves handles, creates team, returns sanitized projection", async () => {
+    let presentationRefreshes = 0;
     // 1. Create a catalog handle for target1
     const callerGen = registry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
     const target1Gen = registry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
@@ -333,10 +334,12 @@ describe("Pet Team Route Execution & Lifecycle", () => {
       teamStore,
       derivePetId,
       sessions: getSessions(),
+      onTeamPresentationChanged: () => { presentationRefreshes += 1; },
     });
 
     await result.done;
     assert.equal(result.statusCode, 200);
+    assert.equal(presentationRefreshes, 1);
     const body = JSON.parse(result.body);
     assert.equal(body.schemaVersion, "1");
     assert.equal(body.kind, "team_create");
@@ -844,6 +847,7 @@ describe("Pet Team Route Execution & Lifecycle", () => {
   });
 
   test("leader and member board writes update revision, project updatedBy, and support session fallback", async () => {
+    let presentationRefreshes = 0;
     const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
     const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
 
@@ -876,10 +880,12 @@ describe("Pet Team Route Execution & Lifecycle", () => {
         derivePetId,
         sessions: getSessions(),
         env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+        onTeamPresentationChanged: () => { presentationRefreshes += 1; },
       });
 
       await result.done;
       assert.equal(result.statusCode, 200);
+      assert.equal(presentationRefreshes, 1);
       const body = JSON.parse(result.body);
       assert.equal(body.schemaVersion, "1");
       assert.equal(body.kind, "team_board_write");
@@ -915,10 +921,12 @@ describe("Pet Team Route Execution & Lifecycle", () => {
         derivePetId,
         sessions: getSessions(),
         env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+        onTeamPresentationChanged: () => { presentationRefreshes += 1; },
       });
 
       await result.done;
       assert.equal(result.statusCode, 200);
+      assert.equal(presentationRefreshes, 2);
       const body = JSON.parse(result.body);
       assert.equal(body.schemaVersion, "1");
       assert.equal(body.kind, "team_board_write");
