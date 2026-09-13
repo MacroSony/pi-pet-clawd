@@ -361,6 +361,7 @@ function handleStatePost(req, res, options) {
       // "ignore + fall back" pattern used by cwd / agent_id above.
       const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
       const sessionTitle = rawTitle || null;
+      const sessionTitleClear = data.session_title_clear === true && !sessionTitle;
       const contextUsage = normalizeContextUsage(data.context_usage);
       const antigravityQuota = normalizeAntigravityQuota(data.antigravity_quota);
       const claudeQuota = normalizeClaudeQuota(data.claude_quota);
@@ -640,7 +641,8 @@ function handleStatePost(req, res, options) {
           // placeholder → real title swap arrives on session.updated, which
           // maps to no Clawd state). Not gated on the Claude telemetry flag —
           // it's not Claude statusline data.
-          if (sessionTitle) metaUpdate.sessionTitle = sessionTitle;
+          if (sessionTitleClear) metaUpdate.clearSessionTitle = true;
+          else if (sessionTitle) metaUpdate.sessionTitle = sessionTitle;
           if (Object.keys(metaUpdate).length > 0) {
             metadataAccepted = ctx.updateSessionMetadata(session_id || "default", metaUpdate) === true;
           }
@@ -1000,6 +1002,7 @@ function handleStatePost(req, res, options) {
             ghosttyTerminalId,
             displayHint: display_svg,
             sessionTitle,
+            ...(sessionTitleClear ? { clearSessionTitle: true } : {}),
             contextUsage,
             contextUsageOrigin: resolveStateContextUsageOrigin(agentId, contextUsage),
             assistantLastOutput,

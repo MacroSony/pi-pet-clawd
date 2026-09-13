@@ -421,6 +421,155 @@ describe("pi-extension-core", () => {
     assert.strictEqual(result, false);
     assert.deepStrictEqual(posts, []);
   });
+
+  it("boundedly forwards native getSessionName as session_title on state payloads", () => {
+    const ctx = makeCtx({
+      sessionManager: {
+        getSessionId: () => "session-title-test",
+        getSessionName: () => "Fix the auth bug",
+      },
+    });
+    const payload = core.buildPayload({
+      state: "working",
+      event: "PreToolUse",
+      ctx,
+    });
+
+    assert.strictEqual(payload.session_title, "Fix the auth bug");
+    assert.strictEqual(payload.session_id, "pi:session-title-test");
+  });
+
+  it("sanitizes control/bidi characters and truncates long session_title values", () => {
+    const longName = "A".repeat(120);
+    const ctx = makeCtx({
+      sessionManager: {
+        getSessionId: () => "sess-1",
+        getSessionName: () => ` \u061C\u200E ${longName}\u202E\u2066 `,
+      },
+    });
+    const payload = core.buildPayload({
+      state: "working",
+      event: "PreToolUse",
+      ctx,
+    });
+
+    assert.strictEqual(payload.session_title.length, core.SESSION_TITLE_MAX);
+    assert.strictEqual(payload.session_title.endsWith("\u2026"), true);
+    assert.strictEqual(payload.session_title.startsWith("A"), true);
+    assert.strictEqual(/[\u0000-\u001F\u007F-\u009F\u061C\u200E-\u200F\u202A-\u202E\u2066-\u2069]/.test(payload.session_title), false);
+
+    // Astral characters and surrogate pairs are handled safely without splitting
+    const astralTitle = "🎉".repeat(85);
+    const sanitizedAstral = core.sanitizeSessionTitle(astralTitle);
+    assert.strictEqual(Array.from(sanitizedAstral).length, 80);
+    assert.strictEqual(sanitizedAstral.endsWith("\u2026"), true);
+    assert.strictEqual(sanitizedAstral.isWellFormed(), true);
+  });
+
+  it("allows fallback behavior when native session name is empty, cleared, or missing", () => {
+    for (const emptyVal of ["", "   ", "\u0000\u001F", null, undefined]) {
+      const ctx = makeCtx({
+        sessionManager: {
+          getSessionId: () => "sess-fallback",
+          getSessionName: () => emptyVal,
+        },
+      });
+      const payload = core.buildPayload({
+        state: "idle",
+        event: "SessionStart",
+        ctx,
+      });
+
+      assert.strictEqual(payload.session_title, undefined);
+      assert.strictEqual(payload.session_title_clear, true);
+    }
+
+    const legacyManagerPayload = core.buildPayload({
+      state: "idle",
+      event: "SessionStart",
+      ctx: makeCtx({ sessionManager: { getSessionId: () => "sess-legacy" } }),
+    });
+    assert.strictEqual(legacyManagerPayload.session_title_clear, undefined);
+  });
+
+  it("does not forward session file or cwd as session_title", () => {
+    const ctx = makeCtx({
+      cwd: "D:/work/secret_project",
+      sessionManager: {
+        getSessionId: () => "sess-no-cwd-title",
+        getSessionFile: () => "/path/to/session.json",
+        // getSessionName is undefined
+      },
+    });
+    const payload = core.buildPayload({
+      state: "idle",
+      event: "SessionStart",
+      ctx,
+    });
+
+    assert.strictEqual(payload.session_title, undefined);
+    assert.strictEqual(payload.cwd, "D:/work/secret_project");
+  });
+
+  it("supports metadata_only in buildPayload and forwards it on session_info_changed", async () => {
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+    const posts = [];
+    core.attach(pi, {
+      shouldReport: () => true,
+      buildPayload: (options) => core.buildPayload(options),
+      postState: async (payload) => {
+        posts.push(payload);
+        return true;
+      },
+    });
+
+    const ctx = makeCtx({
+      sessionManager: {
+        getSessionId: () => "pi-session-meta",
+        getSessionName: () => "Refactored Core",
+      },
+    });
+
+    // Fire session_info_changed event
+    await handlers.session_info_changed({ type: "session_info_changed" }, ctx);
+    await Promise.resolve();
+
+    assert.strictEqual(posts.length, 1);
+    assert.strictEqual(posts[0].metadata_only, true);
+    assert.strictEqual(posts[0].session_title, "Refactored Core");
+    assert.strictEqual(posts[0].event, "SessionUpdate");
+    assert.strictEqual(posts[0].session_id, "pi:pi-session-meta");
+
+    ctx.sessionManager.getSessionName = () => undefined;
+    await handlers.session_info_changed({ type: "session_info_changed", name: null }, ctx);
+    await Promise.resolve();
+    assert.strictEqual(posts.length, 2);
+    assert.strictEqual(posts[1].metadata_only, true);
+    assert.strictEqual(posts[1].session_title, undefined);
+    assert.strictEqual(posts[1].session_title_clear, true);
+  });
+
+  it("prefers explicit session_title options when provided", () => {
+    const ctx = makeCtx({
+      sessionManager: {
+        getSessionId: () => "sess-1",
+        getSessionName: () => "Native Title",
+      },
+    });
+    const payload = core.buildPayload({
+      state: "idle",
+      event: "SessionStart",
+      ctx,
+      session_title: "Explicit Override",
+    });
+
+    assert.strictEqual(payload.session_title, "Explicit Override");
+  });
 });
 
 describe("Pi state transport", () => {

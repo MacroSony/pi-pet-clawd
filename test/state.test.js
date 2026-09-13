@@ -3760,6 +3760,32 @@ describe("updateSession()", () => {
     assert.strictEqual(session.contextUsageOrigin, null);
   });
 
+  it("updateSessionMetadata explicitly clears a title without touching lifecycle state", () => {
+    update(api, { id: "s1", state: "working", sessionTitle: "Temporary Name" });
+    const session = api.sessions.get("s1");
+    session.updatedAt = 12345;
+    const recentEventsBefore = JSON.stringify(session.recentEvents);
+
+    const applied = api.updateSessionMetadata("s1", { clearSessionTitle: true });
+
+    assert.strictEqual(applied, true);
+    assert.strictEqual(session.sessionTitle, null);
+    assert.strictEqual(session.state, "working");
+    assert.strictEqual(session.updatedAt, 12345);
+    assert.strictEqual(JSON.stringify(session.recentEvents), recentEventsBefore);
+    assert.strictEqual(api.updateSessionMetadata("s1", { clearSessionTitle: true }), true, "a valid repeated clear remains accepted");
+  });
+
+  it("full lifecycle state explicitly clears a sticky title when requested", () => {
+    update(api, { id: "s1", state: "idle", sessionTitle: "Temporary Name" });
+    api.updateSession("s1", "working", "PreToolUse", {
+      agentId: "claude-code",
+      cwd: "/tmp",
+      clearSessionTitle: true,
+    });
+    assert.strictEqual(api.sessions.get("s1").sessionTitle, null);
+  });
+
   it("updateSessionMetadata treats a same/normalized-equivalent title as a no-op", () => {
     update(api, { id: "s1", state: "working" });
     api.updateSessionMetadata("s1", { sessionTitle: "Stable Title" });

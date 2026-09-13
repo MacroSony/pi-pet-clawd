@@ -224,7 +224,7 @@ function getProcessMetadata(): ProcessMetadata {
 export default function clawdPiExtension(pi: ExtensionAPI): void {
   core.attach(pi, {
     shouldReport: (ctx: ExtensionContext) => core.shouldReport(ctx),
-    buildPayload: ({ state, event, nativeEvent, ctx, livenessOnly, capabilityToken, peerCapabilityToken }: {
+    buildPayload: ({ state, event, nativeEvent, ctx, livenessOnly, capabilityToken, peerCapabilityToken, metadataOnly, sessionTitle, clearSessionTitle }: {
       state: string;
       event: string;
       nativeEvent: ExtensionEvent;
@@ -232,6 +232,9 @@ export default function clawdPiExtension(pi: ExtensionAPI): void {
       livenessOnly?: boolean;
       capabilityToken?: string;
       peerCapabilityToken?: string;
+      metadataOnly?: boolean;
+      sessionTitle?: string | null;
+      clearSessionTitle?: boolean;
     }) => core.buildPayload({
       state,
       event,
@@ -240,6 +243,9 @@ export default function clawdPiExtension(pi: ExtensionAPI): void {
       livenessOnly,
       capabilityToken,
       peerCapabilityToken,
+      metadataOnly,
+      sessionTitle,
+      clearSessionTitle,
       metadata: getProcessMetadata(),
       agentPid: process.pid,
     }),

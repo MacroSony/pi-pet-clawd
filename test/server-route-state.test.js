@@ -1697,6 +1697,44 @@ describe("server-route-state POST", () => {
     assert.deepStrictEqual(metadataCalls[0][1], { sessionTitle: "My Real Title" });
   });
 
+  it("metadata_only session_title_clear routes an explicit native-name clear", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      metadata_only: true,
+      session_id: "pi:ses_clear",
+      agent_id: "pi",
+      hook_source: "pi-extension",
+      session_title_clear: true,
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.headers[CLAWD_METADATA_ACCEPTED_HEADER], "1");
+    assert.strictEqual(res.calls.updateSession.length, 0);
+    assert.strictEqual(metadataCalls.length, 1);
+    assert.deepStrictEqual(metadataCalls[0][1], { clearSessionTitle: true });
+  });
+
+  it("session_title wins over a conflicting clear marker", async () => {
+    const metadataCalls = [];
+    const res = await callStatePost(JSON.stringify({
+      state: "idle",
+      metadata_only: true,
+      session_id: "pi:ses_named",
+      agent_id: "pi",
+      hook_source: "pi-extension",
+      session_title: "Kept Name",
+      session_title_clear: true,
+    }), {
+      ctx: { updateSessionMetadata: acceptedMetadataSpy(metadataCalls) },
+    });
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.deepStrictEqual(metadataCalls[0][1], { sessionTitle: "Kept Name" });
+  });
+
   it("metadata_only session_title is allowed even when the Claude telemetry gate blocks context", async () => {
     const metadataCalls = [];
     const res = await callStatePost(JSON.stringify({

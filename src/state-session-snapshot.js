@@ -451,6 +451,81 @@ function normalizeSessionsIterable(sessions) {
   return [];
 }
 
+function isHumanVisibleActiveEntry(entry) {
+  if (!entry) return false;
+  if (entry.state === "sleeping") return false;
+  if (entry.headless === true) return false;
+  if (entry.hiddenFromHud === true) return false;
+  return true;
+}
+
+function attachDisambiguationSuffix(baseTitle, suffix) {
+  if (typeof baseTitle !== "string") return suffix.trim();
+  const maxSuffixLen = Array.from(suffix).length;
+  const maxBaseLen = Math.max(0, SESSION_TITLE_MAX - maxSuffixLen);
+  const baseChars = Array.from(baseTitle);
+  if (baseChars.length <= maxBaseLen) {
+    return `${baseTitle}${suffix}`;
+  }
+  if (maxBaseLen <= 1) {
+    return suffix.trim();
+  }
+  const truncatedBase = `${baseChars.slice(0, maxBaseLen - 1).join("")}\u2026`;
+  return `${truncatedBase}${suffix}`;
+}
+
+function disambiguateSessionDisplayTitles(entries) {
+  if (!Array.isArray(entries) || entries.length <= 1) return entries;
+
+  const groups = new Map();
+  for (const entry of entries) {
+    if (!isHumanVisibleActiveEntry(entry)) continue;
+    const hostKey = entry.host || "";
+    const titleKey = typeof entry.displayTitle === "string" ? entry.displayTitle.toLowerCase() : "";
+    if (!titleKey) continue;
+    const groupKey = `${hostKey}\u0000${titleKey}`;
+    let group = groups.get(groupKey);
+    if (!group) {
+      group = [];
+      groups.set(groupKey, group);
+    }
+    group.push(entry);
+  }
+
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue;
+
+    let k = 4;
+    while (k < 64) {
+      const prefixes = new Set(
+        group.map((entry) => {
+          const rawTag = getEntryDisplaySessionTag(entry) || buildDisplaySessionTag(entry.id);
+          const fullTag = (rawTag && rawTag.length >= k)
+            ? rawTag
+            : crypto.createHash("sha256").update(String(entry.id || "").trim()).digest("hex");
+          return fullTag.slice(0, k).toUpperCase();
+        })
+      );
+      if (prefixes.size === group.length) {
+        break;
+      }
+      k += 1;
+    }
+
+    for (const entry of group) {
+      const rawTag = getEntryDisplaySessionTag(entry) || buildDisplaySessionTag(entry.id);
+      const fullTag = (rawTag && rawTag.length >= k)
+        ? rawTag
+        : crypto.createHash("sha256").update(String(entry.id || "").trim()).digest("hex");
+      const discriminator = fullTag.slice(0, k).toUpperCase();
+      const suffix = ` #${discriminator}`;
+      entry.displayTitle = attachDisambiguationSuffix(entry.displayTitle, suffix);
+    }
+  }
+
+  return entries;
+}
+
 function buildSessionSnapshot(sessions, options = {}) {
   const entries = [];
   const sessionAliases = options.sessionAliases && typeof options.sessionAliases === "object"
@@ -476,6 +551,8 @@ function buildSessionSnapshot(sessions, options = {}) {
       sessionAutomationRecord: automationRecord,
     }));
   }
+
+  disambiguateSessionDisplayTitles(entries);
 
   const dashboardEntries = entries.slice().sort(sessionUpdatedAtComparator);
   const menuEntries = entries.slice().sort((a, b) => sessionMenuComparator(a, b, options.statePriority));
@@ -669,4 +746,7 @@ module.exports = {
   buildSessionSnapshot,
   getActiveSessionAliasKeys,
   sessionSnapshotSignature,
+  isHumanVisibleActiveEntry,
+  attachDisambiguationSuffix,
+  disambiguateSessionDisplayTitles,
 };

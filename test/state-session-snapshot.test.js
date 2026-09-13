@@ -1272,3 +1272,221 @@ describe("state-session-snapshot builder", () => {
     assert.notStrictEqual(sessionSnapshotSignature(nova), sessionSnapshotSignature(renamed));
   });
 });
+
+describe("display title disambiguation", () => {
+  it("disambiguates same-host case-insensitive duplicate displayTitle values with #<TAG> suffix", () => {
+    const s1Id = "pi:sess-1";
+    const s2Id = "pi:sess-2";
+    const sessions = new Map([
+      [s1Id, session("working", {
+        agentId: "pi",
+        sessionTitle: "Assistant",
+      })],
+      [s2Id, session("thinking", {
+        agentId: "pi",
+        sessionTitle: "assistant",
+      })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, { statePriority: STATE_PRIORITY });
+    const s1 = snapshot.sessions.find((s) => s.id === s1Id);
+    const s2 = snapshot.sessions.find((s) => s.id === s2Id);
+
+    const tag1 = buildDisplaySessionTag(s1Id).slice(0, 4).toUpperCase();
+    const tag2 = buildDisplaySessionTag(s2Id).slice(0, 4).toUpperCase();
+
+    assert.strictEqual(s1.displayTitle, `Assistant #${tag1}`);
+    assert.strictEqual(s2.displayTitle, `assistant #${tag2}`);
+    assert.notStrictEqual(s1.displayTitle, s2.displayTitle);
+  });
+
+  it("does not suffix unique titles on the same host", () => {
+    const sessions = new Map([
+      ["s1", session("working", { sessionTitle: "Task Alpha" })],
+      ["s2", session("idle", { sessionTitle: "Task Beta" })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, { statePriority: STATE_PRIORITY });
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "s1").displayTitle, "Task Alpha");
+    assert.strictEqual(snapshot.sessions.find((s) => s.id === "s2").displayTitle, "Task Beta");
+  });
+
+  it("does not suffix same title across different hosts", () => {
+    const sessions = new Map([
+      ["s-local", session("working", { sessionTitle: "Assistant", host: null })],
+      ["s-ssh", session("working", { sessionTitle: "Assistant", host: "devbox" })],
+      ["s-wsl", session("working", { sessionTitle: "Assistant", host: "wsl:Ubuntu" })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, { statePriority: STATE_PRIORITY });
+    for (const entry of snapshot.sessions) {
+      assert.strictEqual(entry.displayTitle, "Assistant");
+    }
+  });
+
+  it("excludes sleeping, headless, and hidden sessions from creating collision noise", () => {
+    const sessions = new Map([
+      ["active-1", session("working", { sessionTitle: "Assistant" })],
+      ["sleeping-1", session("sleeping", { sessionTitle: "Assistant" })],
+      ["headless-1", session("working", { sessionTitle: "Assistant", headless: true })],
+      ["hidden-1", session("idle", {
+        sessionTitle: "Assistant",
+        sourcePid: 9999,
+        pidReachable: true,
+        recentEvents: [{ event: "Stop", state: "attention", at: 100 }],
+      })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, {
+      statePriority: STATE_PRIORITY,
+      sessionHudCleanupDetached: true,
+      isProcessAlive: () => false,
+    });
+
+    const active = snapshot.sessions.find((s) => s.id === "active-1");
+    const sleeping = snapshot.sessions.find((s) => s.id === "sleeping-1");
+    const headless = snapshot.sessions.find((s) => s.id === "headless-1");
+    const hidden = snapshot.sessions.find((s) => s.id === "hidden-1");
+
+    assert.strictEqual(active.displayTitle, "Assistant");
+    assert.strictEqual(sleeping.displayTitle, "Assistant");
+    assert.strictEqual(headless.displayTitle, "Assistant");
+    assert.strictEqual(hidden.displayTitle, "Assistant");
+
+    // When a second active session joins, only the active sessions collide
+    sessions.set("active-2", session("thinking", { sessionTitle: "Assistant" }));
+    const snapshot2 = buildSessionSnapshot(sessions, {
+      statePriority: STATE_PRIORITY,
+      sessionHudCleanupDetached: true,
+      isProcessAlive: () => false,
+    });
+
+    const active1WithCol = snapshot2.sessions.find((s) => s.id === "active-1");
+    const active2WithCol = snapshot2.sessions.find((s) => s.id === "active-2");
+    const sleepingWithCol = snapshot2.sessions.find((s) => s.id === "sleeping-1");
+
+    assert.strictEqual(active1WithCol.displayTitle.startsWith("Assistant #"), true);
+    assert.strictEqual(active2WithCol.displayTitle.startsWith("Assistant #"), true);
+    assert.strictEqual(sleepingWithCol.displayTitle, "Assistant");
+  });
+
+  it("is deterministic across session map insertion order and restarts", () => {
+    const s1 = session("working", { sessionTitle: "Worker" });
+    const s2 = session("thinking", { sessionTitle: "Worker" });
+
+    const snapA = buildSessionSnapshot(new Map([["a", s1], ["b", s2]]), { statePriority: STATE_PRIORITY });
+    const snapB = buildSessionSnapshot(new Map([["b", s2], ["a", s1]]), { statePriority: STATE_PRIORITY });
+
+    const aTitleA = snapA.sessions.find((s) => s.id === "a").displayTitle;
+    const aTitleB = snapB.sessions.find((s) => s.id === "a").displayTitle;
+    const bTitleA = snapA.sessions.find((s) => s.id === "b").displayTitle;
+    const bTitleB = snapB.sessions.find((s) => s.id === "b").displayTitle;
+
+    assert.strictEqual(aTitleA, aTitleB);
+    assert.strictEqual(bTitleA, bTitleB);
+  });
+
+  it("preserves SESSION_TITLE_MAX when appending disambiguation suffix", () => {
+    const longTitle = "A".repeat(80);
+    const sessions = new Map([
+      ["s1", session("working", { sessionTitle: longTitle })],
+      ["s2", session("thinking", { sessionTitle: longTitle })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, { statePriority: STATE_PRIORITY });
+    const s1 = snapshot.sessions.find((s) => s.id === "s1");
+    const s2 = snapshot.sessions.find((s) => s.id === "s2");
+
+    assert.strictEqual(Array.from(s1.displayTitle).length, 80);
+    assert.strictEqual(Array.from(s2.displayTitle).length, 80);
+    assert.match(s1.displayTitle, /… #[0-9A-F]{4,}$/);
+    assert.match(s2.displayTitle, /… #[0-9A-F]{4,}$/);
+
+    // Astral code points (emojis) are preserved and not split
+    const emojiTitle = "🎉".repeat(80);
+    const emojiSessions = new Map([
+      ["e1", session("working", { sessionTitle: emojiTitle })],
+      ["e2", session("thinking", { sessionTitle: emojiTitle })],
+    ]);
+    const emojiSnapshot = buildSessionSnapshot(emojiSessions, { statePriority: STATE_PRIORITY });
+    const e1 = emojiSnapshot.sessions.find((s) => s.id === "e1");
+    assert.strictEqual(Array.from(e1.displayTitle).length, 80);
+    assert.strictEqual(e1.displayTitle.isWellFormed(), true);
+  });
+
+  it("preserves privacy by never including rawSessionId, cwd, petId, or token in disambiguated title", () => {
+    const rawSessionId = "secret-raw-uuid-019e115a-4df2-7ed0";
+    const cwd = "/home/user/super_private_repo";
+    const sessions = new Map([
+      ["priv-1", session("working", {
+        sessionTitle: "Private Task",
+        rawSessionId,
+        cwd,
+      })],
+      ["priv-2", session("thinking", {
+        sessionTitle: "Private Task",
+        rawSessionId: "another-secret-uuid",
+        cwd: "/home/user/another_repo",
+      })],
+    ]);
+
+    const snapshot = buildSessionSnapshot(sessions, { statePriority: STATE_PRIORITY });
+    for (const entry of snapshot.sessions) {
+      assert.strictEqual(entry.displayTitle.includes(rawSessionId), false);
+      assert.strictEqual(entry.displayTitle.includes(cwd), false);
+      assert.strictEqual(entry.displayTitle.includes("super_private"), false);
+      assert.strictEqual(entry.displayTitle.includes("secret-raw"), false);
+      assert.match(entry.displayTitle, /^Private Task #[0-9A-F]+$/);
+    }
+  });
+
+  it("reflects disambiguation in snapshot signature and HUD/Dashboard titles", () => {
+    const s1 = session("working", { sessionTitle: "Assistant", updatedAt: 2000 });
+    const s2 = session("thinking", { sessionTitle: "Assistant", updatedAt: 1000 });
+
+    const singleSnapshot = buildSessionSnapshot(new Map([["s1", s1]]), { statePriority: STATE_PRIORITY });
+    assert.strictEqual(singleSnapshot.sessions[0].displayTitle, "Assistant");
+    assert.strictEqual(singleSnapshot.hudLastTitle, "Assistant");
+
+    const dualSnapshot = buildSessionSnapshot(new Map([["s1", s1], ["s2", s2]]), { statePriority: STATE_PRIORITY });
+    assert.notStrictEqual(sessionSnapshotSignature(singleSnapshot), sessionSnapshotSignature(dualSnapshot));
+    assert.strictEqual(dualSnapshot.sessions[0].displayTitle.startsWith("Assistant #"), true);
+    assert.strictEqual(dualSnapshot.hudLastTitle.startsWith("Assistant #"), true);
+    assert.strictEqual(dualSnapshot.lastTitle.startsWith("Assistant #"), true);
+
+    // When s2 goes to sleep, s1 loses its suffix and signature changes
+    const s2Sleeping = { ...s2, state: "sleeping" };
+    const sleepSnapshot = buildSessionSnapshot(new Map([["s1", s1], ["s2", s2Sleeping]]), { statePriority: STATE_PRIORITY });
+    assert.strictEqual(sleepSnapshot.sessions.find((s) => s.id === "s1").displayTitle, "Assistant");
+    assert.notStrictEqual(sessionSnapshotSignature(dualSnapshot), sessionSnapshotSignature(sleepSnapshot));
+  });
+
+  it("extends discriminator length deterministically when 4-character prefix collides", () => {
+    // Construct entries with synthetic matching 4-hex prefix
+    const mockEntries = [
+      { id: "sess-a", displayTitle: "Duplicate", state: "working", host: null, displaySessionTag: "A1B2C00000" },
+      { id: "sess-b", displayTitle: "Duplicate", state: "working", host: null, displaySessionTag: "A1B2D00000" },
+    ];
+
+    const { disambiguateSessionDisplayTitles } = require("../src/state-session-snapshot");
+    disambiguateSessionDisplayTitles(mockEntries);
+
+    // At k=4, both have prefix A1B2. k must extend to 5 -> A1B2C and A1B2D
+    assert.strictEqual(mockEntries[0].displayTitle, "Duplicate #A1B2C");
+    assert.strictEqual(mockEntries[1].displayTitle, "Duplicate #A1B2D");
+  });
+
+  it("respects Pi native sessionTitle precedence over cwd and shortened id", () => {
+    const s = session("working", {
+      agentId: "pi",
+      sessionTitle: "My Named Pi Turn",
+      cwd: "/home/user/myproject",
+      rawSessionId: "pi:session-1234567890",
+    });
+
+    const snapshot = buildSessionSnapshot(new Map([["pi:s1", s]]), { statePriority: STATE_PRIORITY });
+    assert.strictEqual(snapshot.sessions[0].displayTitle, "My Named Pi Turn");
+    assert.strictEqual(snapshot.sessions[0].sessionTitle, "My Named Pi Turn");
+    assert.strictEqual(snapshot.sessions[0].displayFolder, "myproject");
+  });
+});

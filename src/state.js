@@ -1486,7 +1486,8 @@ function updateSessionMetadata(sessionId, opts = {}) {
   const incomingTitle = typeof opts.sessionTitle === "string"
     ? normalizeTitle(opts.sessionTitle)
     : null;
-  if (!incomingContextUsage && !incomingTitle) return false;
+  const clearSessionTitle = opts.clearSessionTitle === true && !incomingTitle;
+  if (!incomingContextUsage && !incomingTitle && !clearSessionTitle) return false;
   let applied = false;
   if (incomingContextUsage) {
     const resolved = resolveContextUsageUpdate(
@@ -1516,7 +1517,10 @@ function updateSessionMetadata(sessionId, opts = {}) {
   // freshness, and a rename must not make stale telemetry look fresh. The
   // title broadcasts anyway - sessionTitle/displayTitle are in the snapshot
   // signature, so emitSessionSnapshot below fans it out.
-  if (incomingTitle && incomingTitle !== session.sessionTitle) {
+  if (clearSessionTitle && session.sessionTitle !== null) {
+    session.sessionTitle = null;
+    applied = true;
+  } else if (incomingTitle && incomingTitle !== session.sessionTitle) {
     session.sessionTitle = incomingTitle;
     applied = true;
   }
@@ -1895,6 +1899,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     ghosttyTerminalId = null,
     displayHint = undefined,
     sessionTitle = null,
+    clearSessionTitle = false,
     contextUsage = null,
     contextUsageOrigin = null,
     assistantLastOutput = null,
@@ -2042,7 +2047,9 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
       const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
       const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
-      const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+      const srcSessionTitle = clearSessionTitle === true
+        ? null
+        : resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
       const permissionContext = resolveContextUsageUpdate(existing, contextUsage, contextUsageOrigin);
       const srcContextUsage = permissionContext.contextUsage;
       const srcContextUsageOrigin = permissionContext.contextUsageOrigin;
@@ -2175,9 +2182,11 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcCodexOriginator = codexOriginator || (existing && existing.codexOriginator) || null;
   const srcCodexSource = codexSource || (existing && existing.codexSource) || null;
   const srcGhosttyTerminalId = normalizeGhosttyTerminalId(ghosttyTerminalId) || (existing && existing.ghosttyTerminalId) || null;
-  // Sticky: empty input does not clear an existing title. A session that has
-  // ever been named keeps that name until the user explicitly renames it.
-  const srcSessionTitle = resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+  // Titles remain sticky for hooks that omit title metadata. An explicit
+  // clear from a native session naming API restores the cwd/id fallback.
+  const srcSessionTitle = clearSessionTitle === true
+    ? null
+    : resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
   const normalizedIncomingContextUsage = normalizeContextUsage(contextUsage);
   const effectiveContextUsageOrigin = normalizeContextUsageOrigin(contextUsageOrigin)
     || (srcAgentId === "claude-code" && normalizedIncomingContextUsage && normalizedIncomingContextUsage.source === "claude"

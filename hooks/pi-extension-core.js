@@ -12,6 +12,8 @@ const serverConfig = require("./server-config");
 const PI_AGENT_ID = "pi";
 const PI_HOOK_SOURCE = "pi-extension";
 const PEER_CAPABILITY_SLOT_SYMBOL = Symbol.for("pi-pet.peer-capability.v1");
+const SESSION_TITLE_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F\u061C\u200E-\u200F\u202A-\u202E\u2066-\u2069]+/g;
+const SESSION_TITLE_MAX = 80;
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const INBOX_POLL_INTERVAL_MS = 1_000;
 const INBOX_RETRY_INTERVAL_MS = 1_000;
@@ -91,6 +93,52 @@ function safeCall(fn) {
   } catch {
     return null;
   }
+}
+
+function replaceUnpairedSurrogates(value) {
+  let result = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        result += value[index] + value[index + 1];
+        index += 1;
+      } else {
+        result += "\uFFFD";
+      }
+    } else if (code >= 0xDC00 && code <= 0xDFFF) {
+      result += "\uFFFD";
+    } else {
+      result += value[index];
+    }
+  }
+  return result;
+}
+
+function sanitizeSessionTitle(value) {
+  if (typeof value !== "string") return null;
+  const collapsed = replaceUnpairedSurrogates(value)
+    .replace(SESSION_TITLE_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!collapsed) return null;
+  const characters = Array.from(collapsed);
+  return characters.length > SESSION_TITLE_MAX
+    ? `${characters.slice(0, SESSION_TITLE_MAX - 1).join("")}\u2026`
+    : collapsed;
+}
+
+function readSessionTitle(ctx, explicitTitle) {
+  if (typeof explicitTitle === "string") {
+    return sanitizeSessionTitle(explicitTitle);
+  }
+  const manager = ctx && ctx.sessionManager;
+  const raw = safeCall(manager && manager.getSessionName && manager.getSessionName.bind(manager));
+  if (typeof raw === "string") {
+    return sanitizeSessionTitle(raw);
+  }
+  return null;
 }
 
 function readSessionId(ctx) {
@@ -403,6 +451,31 @@ function buildPayload(options = {}) {
     state: safeString(options.state, "idle"),
     session_id: getCanonicalRawSessionId(ctx),
   };
+
+  if (options.metadataOnly === true || options.metadata_only === true) {
+    payload.metadata_only = true;
+  }
+
+  const explicitTitleCandidates = [
+    options.session_title,
+    options.sessionTitle,
+    metadata.session_title,
+    metadata.sessionTitle,
+  ];
+  const explicitTitleProvided = explicitTitleCandidates.some((value) => value !== undefined);
+  const explicitTitle = explicitTitleCandidates.find((value) => value !== undefined);
+  const manager = ctx && ctx.sessionManager;
+  const nativeTitleApiAvailable = !!(manager && typeof manager.getSessionName === "function");
+  const sessionTitle = explicitTitleProvided
+    ? sanitizeSessionTitle(explicitTitle)
+    : readSessionTitle(ctx);
+  if (sessionTitle) {
+    payload.session_title = sessionTitle;
+  } else if (options.clearSessionTitle === true || explicitTitleProvided || nativeTitleApiAvailable) {
+    // Pi's native `/name` supports explicit clearing. Preserve that intent so
+    // Clawd can drop a previously sticky title and resume the cwd/id fallback.
+    payload.session_title_clear = true;
+  }
 
   const agentPid = safePositiveInteger(options.agentPid);
   if (agentPid) payload.agent_pid = agentPid;
@@ -1317,6 +1390,23 @@ function attach(pi, deps = {}) {
     return send("sleeping", "SessionEnd", nativeEvent, ctx, true);
   });
 
+  pi.on("session_info_changed", (nativeEvent, ctx) => {
+    rememberContext(ctx);
+    const hasEventName = !!nativeEvent && Object.prototype.hasOwnProperty.call(nativeEvent, "name");
+    const eventTitle = hasEventName ? nativeEvent.name : undefined;
+    return send(
+      contextIsIdle(ctx) ? "idle" : "working",
+      "SessionUpdate",
+      nativeEvent,
+      ctx,
+      false,
+      {
+        metadataOnly: true,
+        ...(hasEventName ? { sessionTitle: eventTitle, clearSessionTitle: !sanitizeSessionTitle(eventTitle) } : {}),
+      }
+    );
+  });
+
   pi.on("tool_call", handleToolCall);
 
   pi.on("tool_result", (nativeEvent, ctx) => {
@@ -1348,6 +1438,7 @@ const api = {
   PEER_CAPABILITY_SLOT: PEER_CAPABILITY_SLOT_SYMBOL,
   PI_AGENT_ID,
   PI_HOOK_SOURCE,
+  SESSION_TITLE_MAX,
   attach,
   buildPayload,
   createRemoteInboxConsumer,
@@ -1357,6 +1448,8 @@ const api = {
   parseMode,
   postInboxJson,
   postStateToClawd,
+  readSessionTitle,
+  sanitizeSessionTitle,
   shouldReport,
   validateClaimedPeerMessage,
 };
