@@ -378,6 +378,19 @@ test("rejects invalid schema fields with 400", async () => {
   }
 });
 
+test("user text validation counts Unicode code points and rejects unsafe controls", () => {
+  const base = {
+    schemaVersion: "1",
+    kind: "user_message",
+    petId: "pet_unicode",
+  };
+
+  assert.deepEqual(validatePetInboxPayload({ ...base, text: "🐶".repeat(2000) }), { ok: true });
+  assert.equal(validatePetInboxPayload({ ...base, text: "🐶".repeat(2001) }).ok, false);
+  assert.equal(validatePetInboxPayload({ ...base, text: "unsafe\u0000text" }).ok, false);
+  assert.deepEqual(validatePetInboxPayload({ ...base, text: "line one\n\tline two" }), { ok: true });
+});
+
 test("createdAtMs is rejected as unknown property (coordinator/runtime owns timestamp)", async () => {
   const { res, result } = createMockRes();
   const req = createMockReq({

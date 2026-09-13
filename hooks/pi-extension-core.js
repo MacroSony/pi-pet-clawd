@@ -21,6 +21,8 @@ const INBOX_SETTLE_DEADLINE_MS = 60_000;
 const MAX_INBOX_REQUEST_BYTES = 16 * 1024;
 const MAX_INBOX_RESPONSE_BYTES = 64 * 1024;
 const INBOX_HTTP_TIMEOUT_MS = 5_000;
+const CHAT_ASSISTANT_MAX_BYTES = 8_192;
+const CHAT_DISALLOWED_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 
 // Kept in step with hooks/shared-process.js NESTED_TERMINAL_ENV; duplicated
 // rather than imported because this module ships standalone in the Pi extension.
@@ -433,6 +435,293 @@ function validateClaimedMessage(data) {
   };
 }
 
+function extractInputText(event) {
+  if (typeof event === "string") return event;
+  if (!event || typeof event !== "object") return "";
+  if (typeof event.text === "string") return event.text;
+  if (typeof event.input === "string") return event.input;
+  if (event.input && typeof event.input.text === "string") return event.input.text;
+  return "";
+}
+
+function extractMessage(event) {
+  if (!event || typeof event !== "object") return null;
+  if (event.message && typeof event.message === "object") return event.message;
+  return event;
+}
+
+function extractRole(event) {
+  const msg = extractMessage(event);
+  if (!msg || typeof msg !== "object") return null;
+  if (typeof msg.role === "string") return msg.role.toLowerCase();
+  if (typeof event.role === "string") return event.role.toLowerCase();
+  return null;
+}
+
+function extractUserText(event) {
+  const msg = extractMessage(event);
+  if (!msg) return "";
+  if (typeof msg.content === "string") return msg.content;
+  if (typeof msg.text === "string") return msg.text;
+  if (Array.isArray(msg.content)) {
+    return msg.content
+      .filter((block) => block && block.type === "text" && typeof block.text === "string")
+      .map((block) => block.text)
+      .join("\n");
+  }
+  return "";
+}
+
+function sanitizeChatAssistantText(text) {
+  if (typeof text !== "string") return "";
+  const cleaned = text.replace(CHAT_DISALLOWED_CONTROL_RE, "").trim();
+  if (!cleaned) return "";
+  if (Buffer.byteLength(cleaned, "utf8") <= CHAT_ASSISTANT_MAX_BYTES) return cleaned;
+
+  let bytes = 0;
+  let bounded = "";
+  for (const character of cleaned) {
+    const nextBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + nextBytes > CHAT_ASSISTANT_MAX_BYTES) break;
+    bounded += character;
+    bytes += nextBytes;
+  }
+  return bounded;
+}
+
+function extractAssistantText(msg) {
+  if (!msg || typeof msg !== "object") return "";
+  if (typeof msg.content === "string") {
+    return sanitizeChatAssistantText(msg.content);
+  }
+  if (Array.isArray(msg.content)) {
+    const textParts = [];
+    for (const block of msg.content) {
+      if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+        const text = block.text.trim();
+        if (text) textParts.push(text);
+      }
+    }
+    return sanitizeChatAssistantText(textParts.join("\n"));
+  }
+  if (typeof msg.text === "string") {
+    return sanitizeChatAssistantText(msg.text);
+  }
+  return "";
+}
+
+function isErrorOrAborted(event, msg) {
+  if (event && (event.error || event.aborted || event.status === "error" || event.status === "aborted")) {
+    return true;
+  }
+  const stopReason = msg && (msg.stopReason || msg.stop_reason);
+  if (msg && (msg.error || msg.errorMessage || stopReason === "error" || stopReason === "aborted" || msg.status === "error" || msg.status === "aborted")) {
+    return true;
+  }
+  return false;
+}
+
+function createChatTurnTracker({
+  identity,
+  peerCapabilityToken,
+  httpRequest = http.request,
+  now = Date.now,
+  postJson = postInboxJson,
+  getRawSessionId = () => "pi:default",
+} = {}) {
+  let pendingDispatches = [];
+  let pendingOrigins = [];
+  let activeCandidate = null;
+
+  function prune(nowMs) {
+    const cutoff = nowMs - 300_000;
+    pendingDispatches = pendingDispatches.filter((d) => d.dispatchedAtMs >= cutoff);
+    if (pendingDispatches.length > 50) {
+      pendingDispatches = pendingDispatches.slice(-50);
+    }
+    // An observed origin is already owned by Pi's queue and may wait behind a
+    // long-running tool for more than five minutes. Do not age it out. Keep a
+    // generous emergency bound while preserving the oldest turns Pi will run first.
+    if (pendingOrigins.length > 200) {
+      pendingOrigins = pendingOrigins.slice(0, 200);
+    }
+  }
+
+  function noteDispatchedUserMessage({ commandId, text, rawSessionId, dispatchedAtMs }) {
+    if (!commandId || typeof text !== "string") return;
+    const nowMs = typeof now === "function" ? now() : Date.now();
+    const record = {
+      commandId,
+      text,
+      rawSessionId: rawSessionId || null,
+      dispatchedAtMs: (typeof dispatchedAtMs === "number" && Number.isFinite(dispatchedAtMs)) ? dispatchedAtMs : nowMs,
+    };
+    prune(nowMs);
+    pendingDispatches = pendingDispatches.filter((dispatch) => dispatch.commandId !== commandId);
+    pendingOrigins = pendingOrigins.filter((origin) => origin.commandId !== commandId);
+    pendingDispatches.push(record);
+  }
+
+  function discardDispatchedUserMessage(commandId) {
+    if (typeof commandId !== "string" || !commandId) return;
+    pendingDispatches = pendingDispatches.filter((dispatch) => dispatch.commandId !== commandId);
+    pendingOrigins = pendingOrigins.filter((origin) => origin.commandId !== commandId);
+  }
+
+  function finalizeCandidate(candidate) {
+    if (!candidate || candidate.status !== "active" || typeof candidate.assistantText !== "string" || !candidate.assistantText) {
+      return;
+    }
+    const rawSessionId = candidate.rawSessionId || (typeof getRawSessionId === "function" ? getRawSessionId() : "pi:default");
+    if (!isStartableRawSessionId(rawSessionId) || !isValidCapabilityToken(peerCapabilityToken) || !isUsableRemoteIdentity(identity)) {
+      return;
+    }
+    const body = {
+      schemaVersion: "1",
+      kind: "pet_chat_complete",
+      rawSessionId,
+      capabilityToken: peerCapabilityToken,
+      commandId: candidate.commandId,
+      assistantText: candidate.assistantText,
+    };
+    try {
+      const p = postJson({
+        identity,
+        path: "/pet-chat/complete",
+        payload: body,
+        httpRequest,
+      });
+      if (p && typeof p.then === "function") {
+        p.catch(() => {});
+      }
+    } catch {
+      // Swallowed completely
+    }
+  }
+
+  function handleInput(event, ctx) {
+    const nowMs = typeof now === "function" ? now() : Date.now();
+    prune(nowMs);
+    const source = event && typeof event === "object" ? event.source : null;
+    if (source !== "extension") {
+      return;
+    }
+    const text = extractInputText(event);
+    if (!text) return;
+
+    const currentRawSession = ctx ? getCanonicalRawSessionId(ctx) : (typeof getRawSessionId === "function" ? getRawSessionId() : null);
+
+    const matchIndex = pendingDispatches.findIndex((d) => {
+      if (d.text !== text) return false;
+      if (currentRawSession && d.rawSessionId && d.rawSessionId !== currentRawSession) {
+        return false;
+      }
+      return true;
+    });
+
+    if (matchIndex !== -1) {
+      const matched = pendingDispatches.splice(matchIndex, 1)[0];
+      pendingOrigins.push({
+        ...matched,
+        rawSessionId: matched.rawSessionId || currentRawSession,
+      });
+    }
+  }
+
+  function handleMessageEnd(event, ctx) {
+    const msg = extractMessage(event);
+    if (!msg) return;
+    const role = extractRole(event);
+
+    if (role === "user") {
+      if (activeCandidate) {
+        if (activeCandidate.status === "active" && activeCandidate.assistantText) {
+          finalizeCandidate(activeCandidate);
+        }
+        activeCandidate = null;
+      }
+
+      const userText = extractUserText(event);
+      const currentRawSession = ctx ? getCanonicalRawSessionId(ctx) : (typeof getRawSessionId === "function" ? getRawSessionId() : null);
+      const messageTimestamp = msg && Number.isSafeInteger(msg.timestamp)
+        ? msg.timestamp
+        : (typeof now === "function" ? now() : Date.now());
+
+      const matchIndex = pendingOrigins.findIndex((o) => {
+        if (o.text !== userText) return false;
+        if (messageTimestamp < o.dispatchedAtMs) return false;
+        if (currentRawSession && o.rawSessionId && o.rawSessionId !== currentRawSession) {
+          return false;
+        }
+        return true;
+      });
+
+      if (matchIndex !== -1) {
+        const matched = pendingOrigins.splice(matchIndex, 1)[0];
+        activeCandidate = {
+          commandId: matched.commandId,
+          userText: matched.text,
+          rawSessionId: matched.rawSessionId || currentRawSession,
+          assistantText: "",
+          status: "active",
+          dispatchedAtMs: matched.dispatchedAtMs,
+        };
+      } else {
+        activeCandidate = null;
+      }
+      return;
+    }
+
+    if (role === "assistant") {
+      if (!activeCandidate || activeCandidate.status !== "active") return;
+
+      if (isErrorOrAborted(event, msg)) {
+        activeCandidate.status = "error";
+        return;
+      }
+
+      const text = extractAssistantText(msg);
+      if (text && typeof text === "string" && text.length > 0) {
+        activeCandidate.assistantText = text;
+      }
+    }
+  }
+
+  function handleAgentEnd(event, ctx) {
+    if (!activeCandidate) return;
+
+    if (isErrorOrAborted(event)) {
+      activeCandidate.status = "error";
+      activeCandidate = null;
+      return;
+    }
+
+    if (activeCandidate.status === "active" && activeCandidate.assistantText) {
+      finalizeCandidate(activeCandidate);
+    }
+    activeCandidate = null;
+  }
+
+  function reset() {
+    pendingDispatches = [];
+    pendingOrigins = [];
+    activeCandidate = null;
+  }
+
+  return {
+    noteDispatchedUserMessage,
+    discardDispatchedUserMessage,
+    handleInput,
+    handleMessageEnd,
+    handleAgentEnd,
+    reset,
+    clear: reset,
+    getActiveCandidate: () => (activeCandidate ? { ...activeCandidate } : null),
+    getPendingDispatches: () => [...pendingDispatches],
+    getPendingOrigins: () => [...pendingOrigins],
+  };
+}
+
 function addToolFields(payload, nativeEvent) {
   if (!nativeEvent || typeof nativeEvent !== "object") return;
   const toolName = safeString(nativeEvent.toolName, "");
@@ -726,6 +1015,8 @@ function createRemoteInboxConsumer({
   pollIntervalMs = INBOX_POLL_INTERVAL_MS,
   retryIntervalMs = INBOX_RETRY_INTERVAL_MS,
   settleDeadlineMs = INBOX_SETTLE_DEADLINE_MS,
+  onUserMessageDispatched = null,
+  onUserMessageDispatchFailed = null,
   isPeerWakeEnabled = () => false,
 }) {
   let active = true;
@@ -966,6 +1257,21 @@ function createRemoteInboxConsumer({
       return;
     }
 
+    // Register before invoking Pi: the installed extension API returns void and
+    // can synchronously emit the `input` event used for correlation.
+    if (typeof onUserMessageDispatched === "function") {
+      try {
+        onUserMessageDispatched({
+          commandId,
+          text,
+          rawSessionId,
+          dispatchedAtMs: claimTime,
+        });
+      } catch {
+        // Correlation is best-effort and cannot alter inbox delivery.
+      }
+    }
+
     let dispatchSuccess = false;
     let dispatchError = null;
     try {
@@ -984,6 +1290,10 @@ function createRemoteInboxConsumer({
     } catch (err) {
       dispatchSuccess = false;
       dispatchError = (err && err.message) ? err.message : "dispatch failed";
+    }
+
+    if (!dispatchSuccess && typeof onUserMessageDispatchFailed === "function") {
+      try { onUserMessageDispatchFailed({ commandId, rawSessionId }); } catch {}
     }
 
     if (!active) return;
@@ -1221,6 +1531,15 @@ function attach(pi, deps = {}) {
     // Shared slot write failure fails closed silently
   }
 
+  const tracker = deps.tracker || createChatTurnTracker({
+    identity,
+    peerCapabilityToken,
+    httpRequest: httpRequestFn,
+    now: nowFn,
+    postJson: (opts) => postInboxJson({ httpRequest: httpRequestFn, ...opts }),
+    getRawSessionId: () => (latestCtx ? getCanonicalRawSessionId(latestCtx) : "pi:default"),
+  });
+
   const deliveryChains = new Map();
   let heartbeatTimer = null;
   let latestCtx = null;
@@ -1332,6 +1651,17 @@ function attach(pi, deps = {}) {
       pollIntervalMs,
       retryIntervalMs,
       settleDeadlineMs,
+      tracker,
+      onUserMessageDispatched: (record) => {
+        if (tracker && typeof tracker.noteDispatchedUserMessage === "function") {
+          tracker.noteDispatchedUserMessage(record);
+        }
+      },
+      onUserMessageDispatchFailed: (record) => {
+        if (tracker && typeof tracker.discardDispatchedUserMessage === "function") {
+          tracker.discardDispatchedUserMessage(record && record.commandId);
+        }
+      },
       isPeerWakeEnabled: () => {
         try {
           const slot = globalTarget[PEER_CAPABILITY_SLOT_SYMBOL];
@@ -1368,10 +1698,18 @@ function attach(pi, deps = {}) {
         lifecycleIdle = false;
       }
       if (nativeName === "session_start") {
+        if (tracker && typeof tracker.reset === "function") {
+          tracker.reset();
+        }
         startHeartbeat();
         const sendResult = send(state, clawdEvent, nativeEvent, ctx, wait);
         if (sendResult !== false) startInboxConsumer(ctx);
         return sendResult;
+      }
+      if (nativeName === "agent_end") {
+        if (tracker && typeof tracker.handleAgentEnd === "function") {
+          tracker.handleAgentEnd(nativeEvent, ctx);
+        }
       }
       return send(state, clawdEvent, nativeEvent, ctx, wait);
     });
@@ -1379,6 +1717,9 @@ function attach(pi, deps = {}) {
 
   pi.on("session_shutdown", (nativeEvent, ctx) => {
     rememberContext(ctx);
+    if (tracker && typeof tracker.reset === "function") {
+      tracker.reset();
+    }
     stopHeartbeat();
     if (activeConsumer) {
       activeConsumer.stop();
@@ -1388,6 +1729,20 @@ function attach(pi, deps = {}) {
     // logical session replacement/quit. Reload must not retire a live pet.
     if (nativeEvent && nativeEvent.reason === "reload") return false;
     return send("sleeping", "SessionEnd", nativeEvent, ctx, true);
+  });
+
+  pi.on("input", (nativeEvent, ctx) => {
+    rememberContext(ctx);
+    if (tracker && typeof tracker.handleInput === "function") {
+      tracker.handleInput(nativeEvent, ctx);
+    }
+  });
+
+  pi.on("message_end", (nativeEvent, ctx) => {
+    rememberContext(ctx);
+    if (tracker && typeof tracker.handleMessageEnd === "function") {
+      tracker.handleMessageEnd(nativeEvent, ctx);
+    }
   });
 
   pi.on("session_info_changed", (nativeEvent, ctx) => {
@@ -1423,13 +1778,21 @@ function attach(pi, deps = {}) {
     );
   });
 
-  return {
+  const result = {
     deliveryChains,
     send,
     startHeartbeat,
     stopHeartbeat,
     getInboxConsumer: () => activeConsumer,
   };
+
+  Object.defineProperty(result, "getTracker", {
+    value: () => tracker,
+    enumerable: false,
+    configurable: true,
+  });
+
+  return result;
 }
 
 const api = {
@@ -1441,7 +1804,9 @@ const api = {
   SESSION_TITLE_MAX,
   attach,
   buildPayload,
+  createChatTurnTracker,
   createRemoteInboxConsumer,
+  createTurnTracker: createChatTurnTracker,
   getCanonicalRawSessionId,
   isInteractiveMode,
   isStartableRawSessionId,

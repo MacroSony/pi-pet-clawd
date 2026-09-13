@@ -74,6 +74,11 @@ const {
   handlePetTeamBoardReadPost,
   handlePetTeamBoardWritePost,
 } = require("./server-route-pet-team");
+const {
+  handlePetChatReadPost,
+  handlePetChatClearPost,
+  handlePetChatCompletePost,
+} = require("./server-route-pet-chat");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
   getCodexOfficialTurnKey,
@@ -799,6 +804,8 @@ function routeHttpRequest(req, res, remoteProfile = null) {
       handlePetInboxPost(req, res, {
         ctx,
         remoteProfile,
+        petChatStore: ctx.petChatStore,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
     } else if (req.method === "POST" && req.url === "/pet-inbox/claim") {
       handlePetInboxClaimPost(req, res, {
@@ -910,6 +917,28 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
         teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
         teamBoardStore: typeof ctx.teamBoardStore === "object" ? ctx.teamBoardStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-chat/read") {
+      handlePetChatReadPost(req, res, {
+        ctx,
+        remoteProfile,
+        petChatStore: ctx.petChatStore,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-chat/clear") {
+      handlePetChatClearPost(req, res, {
+        ctx,
+        remoteProfile,
+        petChatStore: ctx.petChatStore,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-chat/complete") {
+      handlePetChatCompletePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        petChatStore: ctx.petChatStore,
         derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
     } else {

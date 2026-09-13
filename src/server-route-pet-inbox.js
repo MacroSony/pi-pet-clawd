@@ -6,8 +6,10 @@ const {
   CLAWD_SERVER_ID,
 } = require("../hooks/server-config");
 const { loadRuntime } = require("./pet-presentation-bridge");
+const { resolvePetChatStore } = require("./server-route-pet-chat");
 
 const MAX_PET_INBOX_BODY_BYTES = 16 * 1024; // 16 KiB
+const DISALLOWED_USER_TEXT_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
 
 const ALLOWED_SCHEMA_KEYS = Object.freeze(new Set([
   "schemaVersion",
@@ -173,8 +175,12 @@ function validatePetInboxPayload(data) {
     return { ok: false, reason: "petId must be a valid identifier between 1 and 128 characters" };
   }
 
-  if (typeof data.text !== "string" || data.text.length < 1 || data.text.length > 2000) {
-    return { ok: false, reason: "text must be a string between 1 and 2000 characters" };
+  const textLength = typeof data.text === "string" ? Array.from(data.text).length : 0;
+  if (typeof data.text !== "string" || textLength < 1 || textLength > 2000) {
+    return { ok: false, reason: "text must be a string between 1 and 2000 Unicode code points" };
+  }
+  if (DISALLOWED_USER_TEXT_CONTROL_RE.test(data.text)) {
+    return { ok: false, reason: "text contains disallowed control characters" };
   }
 
   if (data.deliverAs !== undefined) {
@@ -446,6 +452,28 @@ function handlePetInboxPost(req, res, options = {}) {
       if (!receipt || typeof receipt !== "object") {
         sendJsonResponse(res, 500, { status: "failed", reason: "invalid receipt from pet runtime" });
         return;
+      }
+
+      if (receipt.status === "queued" || receipt.status === "dispatched") {
+        try {
+          const store = resolvePetChatStore(options);
+          if (store && typeof store.recordUserMessage === "function") {
+            const canonicalPetId = receipt.petId || data.petId;
+            const commandId = receipt.commandId || data.commandId;
+            const createdAtMs = typeof receipt.createdAtMs === "number" ? receipt.createdAtMs : Date.now();
+            const recordPromise = store.recordUserMessage({
+              petId: canonicalPetId,
+              commandId,
+              text: data.text,
+              createdAtMs,
+            });
+            if (recordPromise && typeof recordPromise.catch === "function") {
+              recordPromise.catch(() => {});
+            }
+          }
+        } catch {
+          // Chat logging failure must not block message delivery
+        }
       }
 
       if (receipt.status === "queued") {

@@ -682,3 +682,552 @@ describe("Pi state transport", () => {
     assert.strictEqual(requested, false);
   });
 });
+
+describe("Managed remote Pi chat correlation", () => {
+  const validRemoteIdentity = Object.freeze({
+    ok: true,
+    version: 2,
+    layoutVersion: 1,
+    runtimeKey: "account-default",
+    profileId: "remote-pi",
+    installId: "a".repeat(64),
+    remotePort: 23337,
+    routingNonce: "b".repeat(32),
+    deployedAt: 1,
+  });
+
+  const testPeerToken = "c".repeat(64);
+  const testCapabilityToken = "d".repeat(64);
+
+  function attachForChat(pi, deps) {
+    return core.attach(pi, { now: () => 10_000, ...deps });
+  }
+
+  function createMockHttpCapture(posts) {
+    return (options, callback) => {
+      const chunks = [];
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      req.end = (data) => {
+        if (data) chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
+        const bodyStr = Buffer.concat(chunks).toString("utf8");
+        let body = null;
+        try { body = JSON.parse(bodyStr); } catch {}
+        posts.push({
+          path: options.path,
+          method: options.method,
+          headers: options.headers,
+          port: options.port,
+          body,
+        });
+        queueMicrotask(() => {
+          const res = new EventEmitter();
+          res.statusCode = 200;
+          res.headers = { "x-clawd-server": "clawd-on-desk" };
+          callback(res);
+          res.emit("data", JSON.stringify({ ok: true, status: "completed" }));
+          res.emit("end");
+        });
+      };
+      return req;
+    };
+  }
+
+  it("busy misattribution: queued input during busy turn never activates before current turn completes", async () => {
+    const httpPosts = [];
+    const httpRequest = createMockHttpCapture(httpPosts);
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+      sendUserMessage() {
+        return Promise.resolve();
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-busy" },
+    });
+
+    // Start session
+    await handlers.session_start({}, ctx);
+
+    // 1. Turn 1 dispatched via remote consumer
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-turn-1",
+      text: "turn 1 request",
+      rawSessionId: "pi:sess-busy",
+      dispatchedAtMs: 1000,
+    });
+
+    // 2. Pi emits input event for Turn 1 (source: extension)
+    handlers.input({ source: "extension", text: "turn 1 request" }, ctx);
+
+    // 3. Pi begins Turn 1 with message_end (user)
+    handlers.message_end({
+      message: { role: "user", content: "turn 1 request" },
+    }, ctx);
+
+    assert.ok(tracker.getActiveCandidate());
+    assert.strictEqual(tracker.getActiveCandidate().commandId, "cmd-turn-1");
+
+    // 4. While Turn 1 is responding, Turn 2 is dispatched and queued
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-turn-2",
+      text: "turn 2 request",
+      rawSessionId: "pi:sess-busy",
+      dispatchedAtMs: 2000,
+    });
+    handlers.input({ source: "extension", text: "turn 2 request" }, ctx);
+
+    // CRITICAL: Merely queued input must NOT activate Turn 2 while Turn 1 is still active
+    assert.strictEqual(
+      tracker.getActiveCandidate().commandId,
+      "cmd-turn-1",
+      "Queued input must never activate while current turn is active"
+    );
+
+    // 5. Turn 1 assistant responds
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Turn 1 answer" }],
+      },
+    }, ctx);
+
+    // 6. Turn 1 completes via agent_end
+    await handlers.agent_end({}, ctx);
+
+    // Verify Turn 1 was posted to /pet-chat/complete
+    const completePosts = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(completePosts.length, 1);
+    assert.strictEqual(completePosts[0].body.commandId, "cmd-turn-1");
+    assert.strictEqual(completePosts[0].body.assistantText, "Turn 1 answer");
+    assert.strictEqual(completePosts[0].body.rawSessionId, "pi:sess-busy");
+
+    // 7. Now Turn 2 begins with message_end (user)
+    handlers.message_end({
+      message: { role: "user", content: "turn 2 request" },
+    }, ctx);
+
+    assert.ok(tracker.getActiveCandidate());
+    assert.strictEqual(tracker.getActiveCandidate().commandId, "cmd-turn-2");
+
+    // 8. Turn 2 assistant responds
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Turn 2 answer" }],
+      },
+    }, ctx);
+
+    // 9. Turn 2 completes via agent_end
+    await handlers.agent_end({}, ctx);
+
+    const allCompletePosts = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(allCompletePosts.length, 2);
+    assert.strictEqual(allCompletePosts[1].body.commandId, "cmd-turn-2");
+    assert.strictEqual(allCompletePosts[1].body.assistantText, "Turn 2 answer");
+
+    attached.stopHeartbeat();
+  });
+
+  it("interactive input isolation: interactive user inputs never trigger chat complete posts", async () => {
+    const httpPosts = [];
+    const httpRequest = createMockHttpCapture(httpPosts);
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-interactive" },
+    });
+
+    await handlers.session_start({}, ctx);
+
+    // Interactive user input (source is interactive / user / undefined)
+    handlers.input({ source: "interactive", text: "human typed message" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "human typed message" },
+    }, ctx);
+
+    // Tracker must NOT have an active pet candidate
+    assert.strictEqual(tracker.getActiveCandidate(), null);
+
+    // Assistant responds to the human
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "assistant response to human" }],
+      },
+    }, ctx);
+
+    // Agent ends turn
+    await handlers.agent_end({}, ctx);
+
+    // No /pet-chat/complete posts should ever be made for interactive input
+    const completePosts = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(completePosts.length, 0);
+
+    attached.stopHeartbeat();
+  });
+
+  it("exact authenticated body: verifies all properties and headers sent to /pet-chat/complete", async () => {
+    const httpPosts = [];
+    const httpRequest = createMockHttpCapture(httpPosts);
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-exact-auth" },
+    });
+
+    await handlers.session_start({}, ctx);
+
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-exact-99",
+      text: "tell me a secret",
+      rawSessionId: "pi:sess-exact-auth",
+      dispatchedAtMs: 5000,
+    });
+
+    handlers.input({ source: "extension", text: "tell me a secret" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "tell me a secret" },
+    }, ctx);
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: "The secret is chocolate." },
+        ],
+      },
+    }, ctx);
+
+    await handlers.agent_end({}, ctx);
+
+    const completePosts = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(completePosts.length, 1);
+    const post = completePosts[0];
+
+    // Transport headers
+    assert.strictEqual(post.path, "/pet-chat/complete");
+    assert.strictEqual(post.method, "POST");
+    assert.strictEqual(post.port, 23337);
+    assert.strictEqual(post.headers["x-clawd-routing-nonce"], "b".repeat(32));
+    assert.strictEqual(post.headers["Content-Type"], "application/json");
+
+    // Exact authenticated body
+    assert.deepStrictEqual(post.body, {
+      schemaVersion: "1",
+      kind: "pet_chat_complete",
+      rawSessionId: "pi:sess-exact-auth",
+      capabilityToken: testPeerToken,
+      commandId: "cmd-exact-99",
+      assistantText: "The secret is chocolate.",
+    });
+
+    // Check exact keys
+    assert.deepStrictEqual(
+      Object.keys(post.body).sort(),
+      ["assistantText", "capabilityToken", "commandId", "kind", "rawSessionId", "schemaVersion"]
+    );
+
+    attached.stopHeartbeat();
+  });
+
+  it("thinking/tool privacy: filters out thinking and tool blocks, handles error/abort", async () => {
+    const httpPosts = [];
+    const httpRequest = createMockHttpCapture(httpPosts);
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-privacy" },
+    });
+
+    await handlers.session_start({}, ctx);
+
+    // Turn 1: mixed thinking, tool_use, and text blocks
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-privacy-1",
+      text: "check files",
+      rawSessionId: "pi:sess-privacy",
+      dispatchedAtMs: 1000,
+    });
+    handlers.input({ source: "extension", text: "check files" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "check files" },
+    }, ctx);
+
+    // Intermediate tool call message (no text blocks)
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "I need to run ls" },
+          { type: "tool_use", name: "bash", input: { command: "ls -la" } },
+        ],
+      },
+    }, ctx);
+
+    // Final response message (thinking + text blocks)
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "Now summarizing results" },
+          { type: "text", text: "Found\u0000" },
+          { type: "text", text: "3 files." },
+        ],
+      },
+    }, ctx);
+
+    await handlers.agent_end({}, ctx);
+
+    const completePosts = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(completePosts.length, 1);
+    assert.strictEqual(completePosts[0].body.assistantText, "Found\n3 files.");
+    // Ensure thinking / tool fields are never present
+    assert.strictEqual(completePosts[0].body.thinking, undefined);
+    assert.strictEqual(completePosts[0].body.tool_use, undefined);
+    assert.strictEqual(completePosts[0].body.toolName, undefined);
+
+    // Turn 2: error/aborted assistant is not final
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-privacy-2",
+      text: "error turn",
+      rawSessionId: "pi:sess-privacy",
+      dispatchedAtMs: 2000,
+    });
+    handlers.input({ source: "extension", text: "error turn" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "error turn" },
+    }, ctx);
+
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "partial output before crash" }],
+        stop_reason: "error",
+      },
+    }, ctx);
+
+    await handlers.agent_end({}, ctx);
+
+    // Turn 2 should NOT have posted because it was errored/aborted
+    const afterTurn2 = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(afterTurn2.length, 1);
+
+    // Turn 3: agent_end itself has error/abort
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-privacy-3",
+      text: "aborted turn",
+      rawSessionId: "pi:sess-privacy",
+      dispatchedAtMs: 3000,
+    });
+    handlers.input({ source: "extension", text: "aborted turn" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "aborted turn" },
+    }, ctx);
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "some text" }],
+      },
+    }, ctx);
+
+    await handlers.agent_end({ aborted: true }, ctx);
+
+    const afterTurn3 = httpPosts.filter((p) => p.path === "/pet-chat/complete");
+    assert.strictEqual(afterTurn3.length, 1);
+
+    attached.stopHeartbeat();
+  });
+
+  it("resets tracker on session_start, session_shutdown, and reload", async () => {
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-reset" },
+    });
+
+    // Populate tracker
+    tracker.noteDispatchedUserMessage({ commandId: "c1", text: "t1", dispatchedAtMs: 100 });
+    handlers.input({ source: "extension", text: "t1" }, ctx);
+    assert.strictEqual(tracker.getPendingOrigins().length, 1);
+
+    // 1. Reset on session_start
+    await handlers.session_start({}, ctx);
+    assert.strictEqual(tracker.getPendingDispatches().length, 0);
+    assert.strictEqual(tracker.getPendingOrigins().length, 0);
+    assert.strictEqual(tracker.getActiveCandidate(), null);
+
+    // Populate again
+    tracker.noteDispatchedUserMessage({ commandId: "c2", text: "t2", dispatchedAtMs: 200 });
+    handlers.input({ source: "extension", text: "t2" }, ctx);
+    assert.strictEqual(tracker.getPendingOrigins().length, 1);
+
+    // 2. Reset on extension reload (shutdown with reason: reload)
+    await handlers.session_shutdown({ reason: "reload" }, ctx);
+    assert.strictEqual(tracker.getPendingDispatches().length, 0);
+    assert.strictEqual(tracker.getPendingOrigins().length, 0);
+    assert.strictEqual(tracker.getActiveCandidate(), null);
+
+    // Populate again
+    tracker.noteDispatchedUserMessage({ commandId: "c3", text: "t3", dispatchedAtMs: 300 });
+    handlers.input({ source: "extension", text: "t3" }, ctx);
+    assert.strictEqual(tracker.getPendingOrigins().length, 1);
+
+    // 3. Reset on normal session_shutdown
+    await handlers.session_shutdown({}, ctx);
+    assert.strictEqual(tracker.getPendingDispatches().length, 0);
+    assert.strictEqual(tracker.getPendingOrigins().length, 0);
+    assert.strictEqual(tracker.getActiveCandidate(), null);
+
+    attached.stopHeartbeat();
+  });
+
+  it("chat completion post failure is swallowed and never alters settlement", async () => {
+    let completeRequested = false;
+    const httpRequest = (options, callback) => {
+      if (options.path === "/pet-chat/complete") {
+        completeRequested = true;
+        const req = new EventEmitter();
+        req.destroy = () => {};
+        req.end = () => {
+          queueMicrotask(() => {
+            req.emit("error", new Error("network partition during complete"));
+          });
+        };
+        return req;
+      }
+      const req = new EventEmitter();
+      req.destroy = () => {};
+      req.end = () => {
+        queueMicrotask(() => {
+          const res = new EventEmitter();
+          res.statusCode = 200;
+          res.headers = { "x-clawd-server": "clawd-on-desk" };
+          callback(res);
+          res.emit("end");
+        });
+      };
+      return req;
+    };
+
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+    };
+
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest,
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-swallow" },
+    });
+
+    await handlers.session_start({}, ctx);
+
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-swallow",
+      text: "trigger complete error",
+      rawSessionId: "pi:sess-swallow",
+      dispatchedAtMs: 1000,
+    });
+    handlers.input({ source: "extension", text: "trigger complete error" }, ctx);
+    handlers.message_end({
+      message: { role: "user", content: "trigger complete error" },
+    }, ctx);
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "output before failure" }],
+      },
+    }, ctx);
+
+    // agent_end should not throw or reject
+    await assert.doesNotReject(async () => {
+      await handlers.agent_end({}, ctx);
+    });
+
+    assert.strictEqual(completeRequested, true);
+    attached.stopHeartbeat();
+  });
+});

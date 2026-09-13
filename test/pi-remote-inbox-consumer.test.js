@@ -159,10 +159,16 @@ describe("Remote Pi Inbox Consumer", () => {
     const httpRequests = [];
     const sentMessages = [];
     const handlers = {};
+    const ctx = makeCtx({
+      sessionManager: { getSessionId: () => "sess-42" },
+    });
     const pi = {
       on(event, fn) { handlers[event] = fn; },
       sendUserMessage(text, options) {
         sentMessages.push({ text, options });
+        // Real Pi can emit input before sendUserMessage returns. The remote
+        // consumer must pre-register correlation before making this call.
+        handlers.input({ source: "extension", text }, ctx);
       },
     };
 
@@ -202,17 +208,36 @@ describe("Remote Pi Inbox Consumer", () => {
     const attachResult = core.attach(pi, {
       remoteIdentity: makeRemoteIdentity({ remotePort: 23337 }),
       capabilityToken: "d".repeat(64),
+      peerCapabilityToken: "e".repeat(64),
       shouldReport: () => true,
       postState: async () => true,
       httpRequest: mockHttp,
       pollIntervalMs: 50,
     });
 
-    handlers.session_start({ type: "session_start" }, makeCtx({
-      sessionManager: { getSessionId: () => "sess-42" },
-    }));
+    handlers.session_start({ type: "session_start" }, ctx);
 
     await new Promise((r) => setTimeout(r, 40));
+    assert.equal(attachResult.getTracker().getPendingOrigins().length, 1);
+    assert.equal(attachResult.getTracker().getPendingOrigins()[0].commandId, "cmd-101");
+
+    handlers.message_end({
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "Hello from desk pet!" }],
+        timestamp: Date.now(),
+      },
+    }, ctx);
+    handlers.message_end({
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Hello back from remote Pi." }],
+        stopReason: "stop",
+      },
+    }, ctx);
+    await handlers.agent_end({}, ctx);
+    await new Promise((resolve) => setImmediate(resolve));
+
     attachResult.stopHeartbeat();
     if (attachResult.getInboxConsumer()) attachResult.getInboxConsumer().stop();
 
@@ -234,6 +259,8 @@ describe("Remote Pi Inbox Consumer", () => {
         expandPromptTemplates: false,
       },
     });
+    assert.equal(attachResult.getTracker().getPendingOrigins().length, 0);
+    assert.equal(attachResult.getTracker().getActiveCandidate(), null);
 
     // Verify settle request
     const settleReq = httpRequests.find((r) => r.path === "/pet-inbox/settle");
@@ -246,6 +273,17 @@ describe("Remote Pi Inbox Consumer", () => {
       commandId: "cmd-101",
       claimToken: "tok-abc-123",
       status: "dispatched",
+    });
+
+    const completionReq = httpRequests.find((r) => r.path === "/pet-chat/complete");
+    assert.ok(completionReq, "remote consumer must correlate and post the completed pet turn");
+    assert.deepEqual(completionReq.body, {
+      schemaVersion: "1",
+      kind: "pet_chat_complete",
+      rawSessionId: "pi:sess-42",
+      capabilityToken: "e".repeat(64),
+      commandId: "cmd-101",
+      assistantText: "Hello back from remote Pi.",
     });
   });
 

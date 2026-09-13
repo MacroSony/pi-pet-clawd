@@ -85,7 +85,8 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
       || req.url === "/pet-team/board/read"
       || req.url === "/pet-team/board/write"
     );
-    const nonce = (isPetExpression || isPetInboxClaim || isPetInboxSettle || isPetPeerEndpoint || isPetTeamEndpoint)
+    const isPetChatEndpoint = req.method === "POST" && req.url === "/pet-chat/complete";
+    const nonce = (isPetExpression || isPetInboxClaim || isPetInboxSettle || isPetPeerEndpoint || isPetTeamEndpoint || isPetChatEndpoint)
       ? headerValue
       : (pathValue || queryValue || headerValue);
     const allowedPath = (req.method === "GET" && req.url === "/state")
@@ -95,7 +96,8 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
       || isPetInboxClaim
       || isPetInboxSettle
       || isPetPeerEndpoint
-      || isPetTeamEndpoint;
+      || isPetTeamEndpoint
+      || isPetChatEndpoint;
 
     if (!allowedPath || !timingSafeNonceMatch(nonce, acceptedNonces)) {
       counters.rejectedCount += 1;
