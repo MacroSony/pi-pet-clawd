@@ -31,6 +31,10 @@ test("account-default layout normalizes the reserved runtime key and covers ever
     codexHome: "/home/alice/.codex",
     codexSessionsDir: "/home/alice/.codex/sessions",
     copilotHome: "/home/alice/.copilot",
+    piAgentDir: "/home/alice/.pi/agent",
+    piExtensionDir: "/home/alice/.pi/agent/extensions/clawd-on-desk",
+    piExtensionMarkerFile: "/home/alice/.pi/agent/extensions/clawd-on-desk/.clawd-managed.json",
+    piRemoteIdentityFile: "/home/alice/.pi/agent/extensions/clawd-on-desk/clawd-remote.json",
     clawdStateDir: "/home/alice/.clawd",
     binDir: null,
     wrapperEvidenceDir: null,
@@ -56,7 +60,7 @@ test("account-default layout normalizes the reserved runtime key and covers ever
   assert.equal(layout.statuslineSidecarFile.startsWith(`${layout.claudeHooksDir}/`), true);
 });
 
-test("profile-isolated layout keeps every live path inside its runtime root", () => {
+test("profile-isolated layout keeps profile-local paths inside its runtime root and Pi paths account-global", () => {
   const layout = resolveRemoteRuntimeLayout({
     runtimeMode: REMOTE_RUNTIME_MODE_PROFILE_ISOLATED,
     runtimeKey: "rt_A7x-19",
@@ -68,16 +72,24 @@ test("profile-isolated layout keeps every live path inside its runtime root", ()
   assert.equal(layout.copilotHome, `${layout.runtimeRoot}/copilot`);
   assert.equal(layout.clawdStateDir, `${layout.runtimeRoot}/clawd`);
   assert.equal(layout.legacyMonitorPidFile, null);
+  const accountGlobalPiPaths = new Set([
+    layout.piAgentDir,
+    layout.piExtensionDir,
+    layout.piExtensionMarkerFile,
+    layout.piRemoteIdentityFile,
+  ]);
   for (const item of collectRemoteLayoutPathSet(layout)) {
     assert.equal(
-      item === layout.runtimeRoot || item.startsWith(`${layout.runtimeRoot}/`),
+      accountGlobalPiPaths.has(item)
+        || item === layout.runtimeRoot
+        || item.startsWith(`${layout.runtimeRoot}/`),
       true,
-      `${item} escaped ${layout.runtimeRoot}`,
+      `${item} escaped both the profile root and the intentional account-global Pi root`,
     );
   }
 });
 
-test("different isolated runtime keys have disjoint live path sets", () => {
+test("different isolated runtime keys share only intentional account-global Pi paths", () => {
   const a = resolveRemoteRuntimeLayout({
     runtimeMode: REMOTE_RUNTIME_MODE_PROFILE_ISOLATED,
     runtimeKey: "runtime_a",
@@ -90,7 +102,12 @@ test("different isolated runtime keys have disjoint live path sets", () => {
   });
   const aPaths = collectRemoteLayoutPathSet(a);
   const bPaths = collectRemoteLayoutPathSet(b);
-  assert.deepEqual([...aPaths].filter((item) => bPaths.has(item)), []);
+  assert.deepEqual([...aPaths].filter((item) => bPaths.has(item)).sort(), [
+    a.piAgentDir,
+    a.piExtensionDir,
+    a.piExtensionMarkerFile,
+    a.piRemoteIdentityFile,
+  ].sort());
 });
 
 test("layout rejects path escape and malformed runtime inputs", () => {

@@ -170,7 +170,7 @@ test("remote hook modules execute in a fresh process without reading or writing 
   }
 });
 
-test("two isolated layouts expose disjoint complete live path sets, including wrapper evidence", () => {
+test("two isolated layouts share only account-global Pi paths and isolate all profile-local evidence", () => {
   const layouts = ["runtime_a", "runtime_b"].map((runtimeKey) => (
     resolveRemoteRuntimeLayout({
       runtimeMode: "profile-isolated",
@@ -179,7 +179,12 @@ test("two isolated layouts expose disjoint complete live path sets, including wr
     })
   ));
   const sets = layouts.map(collectRemoteLayoutPathSet);
-  assert.deepEqual([...sets[0]].filter((item) => sets[1].has(item)), []);
+  assert.deepEqual([...sets[0]].filter((item) => sets[1].has(item)).sort(), [
+    layouts[0].piAgentDir,
+    layouts[0].piExtensionDir,
+    layouts[0].piExtensionMarkerFile,
+    layouts[0].piRemoteIdentityFile,
+  ].sort());
   for (const layout of layouts) {
     for (const required of [
       "identityFile",
