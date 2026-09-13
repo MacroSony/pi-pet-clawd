@@ -21,14 +21,23 @@ const {
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
   handlePetTeamDissolvePost,
+  handlePetTeamBoardReadPost,
+  handlePetTeamBoardWritePost,
   validatePetTeamStatusPayload,
   validatePetTeamCreatePayload,
   validatePetTeamDissolvePayload,
+  validatePetTeamBoardReadPayload,
+  validatePetTeamBoardWritePayload,
+  resolveTeamBoardStore,
+  buildSanitizedBoardProjection,
 } = require("../src/server-route-pet-team");
+const initServer = require("../src/server");
 const { createIngressRequestHandler } = require("../src/remote-ssh-ingress");
 
 const rootRuntime = require(path.resolve(__dirname, "../../packages/runtime"));
-const { createTeamStore, derivePetId } = rootRuntime;
+const { createTeamStore, createTeamBoardStore, derivePetId } = rootRuntime;
+
+process.env.CLAWD_PET_RUNTIME_MODULE = path.resolve(__dirname, "../../packages/runtime");
 
 function generateToken() {
   return crypto.randomBytes(32).toString("hex");
@@ -135,6 +144,69 @@ describe("Pet Team Route Payload Validations", () => {
     // Invalid kind
     assert.equal(validatePetTeamDissolvePayload({ ...valid, kind: "other" }).ok, false);
   });
+
+  test("board read payload validation enforces strict keys and schemaVersion", () => {
+    const valid = {
+      schemaVersion: "1",
+      kind: "team_board_read",
+      rawSessionId: "session-1",
+      capabilityToken: generateToken(),
+    };
+    assert.equal(validatePetTeamBoardReadPayload(valid).ok, true);
+
+    // Unknown property
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, extra: "foo" }).ok, false);
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, teamId: "team_1" }).ok, false);
+    // Invalid schemaVersion
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, schemaVersion: "2" }).ok, false);
+    // Invalid kind
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, kind: "team_board_write" }).ok, false);
+    // Invalid rawSessionId
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, rawSessionId: "default" }).ok, false);
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, rawSessionId: "pi:default" }).ok, false);
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, rawSessionId: "" }).ok, false);
+    // Invalid capability token
+    assert.equal(validatePetTeamBoardReadPayload({ ...valid, capabilityToken: "invalid" }).ok, false);
+  });
+
+  test("board write payload validation enforces strict keys, non-negative baseRevision, and markdown control characters", () => {
+    const valid = {
+      schemaVersion: "1",
+      kind: "team_board_write",
+      rawSessionId: "session-1",
+      capabilityToken: generateToken(),
+      baseRevision: 0,
+      markdown: "# Task\n- item 1\titem 2\r\n✨ Unicode OK",
+    };
+    assert.equal(validatePetTeamBoardWritePayload(valid).ok, true);
+
+    // Unknown property
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, extra: "foo" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, teamId: "team_1" }).ok, false);
+    // Invalid schemaVersion
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, schemaVersion: "2" }).ok, false);
+    // Invalid kind
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, kind: "team_board_read" }).ok, false);
+    // Invalid baseRevision
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, baseRevision: -1 }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, baseRevision: 1.5 }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, baseRevision: "0" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, baseRevision: NaN }).ok, false);
+    // Invalid markdown type
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: 123 }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: null }).ok, false);
+    // Disallowed control characters (C0/C1 except LF/CR/TAB)
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x00World" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x08World" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x0BWorld" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x0CWorld" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x1BWorld" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x7FWorld" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x80World" }).ok, false);
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Hello\x9FWorld" }).ok, false);
+    // Allowed control characters (LF, CR, TAB)
+    assert.equal(validatePetTeamBoardWritePayload({ ...valid, markdown: "Line1\nLine2\rLine3\tTabbed" }).ok, true);
+  });
 });
 
 describe("Pet Team Route Execution & Lifecycle", () => {
@@ -153,7 +225,7 @@ describe("Pet Team Route Execution & Lifecycle", () => {
 
   beforeEach(() => {
     tmpDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pet-team-test-"));
-    teamStore = createTeamStore({ env: { PI_PET_DATA_DIR: tmpDataDir } });
+    teamStore = createTeamStore({ env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir } });
     registry = createPetPeerCapabilityRegistry();
     handleStore = createPetPeerHandleStore();
 
@@ -668,12 +740,799 @@ describe("Pet Team Route Execution & Lifecycle", () => {
     await result.done;
     assert.equal(result.statusCode, 413);
   });
+
+  test("board read returns status: none when caller has no active team", async () => {
+    const { res, result } = createMockRes();
+    const req = createMockReq({
+      url: "/pet-team/board/read",
+      body: JSON.stringify({
+        schemaVersion: "1",
+        kind: "team_board_read",
+        rawSessionId: callerRaw,
+        capabilityToken: callerToken,
+      }),
+    });
+
+    handlePetTeamBoardReadPost(req, res, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+    });
+
+    await result.done;
+    assert.equal(result.statusCode, 200);
+    const body = JSON.parse(result.body);
+    assert.equal(body.schemaVersion, "1");
+    assert.equal(body.kind, "team_board_read");
+    assert.equal(body.status, "none");
+    assert.equal(body.board, undefined);
+  });
+
+  test("board write returns 404 when caller has no active team", async () => {
+    const { res, result } = createMockRes();
+    const req = createMockReq({
+      url: "/pet-team/board/write",
+      body: JSON.stringify({
+        schemaVersion: "1",
+        kind: "team_board_write",
+        rawSessionId: callerRaw,
+        capabilityToken: callerToken,
+        baseRevision: 0,
+        markdown: "# My Board",
+      }),
+    });
+
+    handlePetTeamBoardWritePost(req, res, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+    });
+
+    await result.done;
+    assert.equal(result.statusCode, 404);
+    const body = JSON.parse(result.body);
+    assert.equal(body.schemaVersion, "1");
+    assert.equal(body.kind, "team_board_write");
+    assert.equal(body.status, "rejected");
+  });
+
+  test("board read on active team before any write returns rev0 and empty markdown", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "Board Team",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+
+    const { res, result } = createMockRes();
+    const req = createMockReq({
+      url: "/pet-team/board/read",
+      body: JSON.stringify({
+        schemaVersion: "1",
+        kind: "team_board_read",
+        rawSessionId: callerRaw,
+        capabilityToken: callerToken,
+      }),
+    });
+
+    handlePetTeamBoardReadPost(req, res, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+      env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+    });
+
+    await result.done;
+    assert.equal(result.statusCode, 200);
+    const body = JSON.parse(result.body);
+    assert.equal(body.schemaVersion, "1");
+    assert.equal(body.kind, "team_board_read");
+    assert.equal(body.status, "active");
+    assert.deepEqual(body.board, {
+      revision: 0,
+      markdown: "",
+    });
+  });
+
+  test("leader and member board writes update revision, project updatedBy, and support session fallback", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "Collaboration Squad",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+
+    // 1. Leader writes revision 0 -> becomes rev 1
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+          baseRevision: 0,
+          markdown: "# Roadmap\n- [ ] Task 1\tInitial\r\n",
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "updated");
+      assert.equal(body.board.revision, 1);
+      assert.equal(body.board.markdown, "# Roadmap\n- [ ] Task 1\tInitial\r\n");
+      assert.equal(typeof body.board.updatedAtMs, "number");
+      assert.deepEqual(body.board.updatedBy, {
+        displayName: "Leader Pi · Pi",
+        role: "leader",
+      });
+    }
+
+    // 2. Member (target1) writes revision 1 -> becomes rev 2
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: target1Raw,
+          capabilityToken: target1Token,
+          baseRevision: 1,
+          markdown: "# Roadmap\n- [x] Task 1 done",
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "updated");
+      assert.equal(body.board.revision, 2);
+      assert.equal(body.board.markdown, "# Roadmap\n- [x] Task 1 done");
+      assert.equal(typeof body.board.updatedAtMs, "number");
+      assert.deepEqual(body.board.updatedBy, {
+        displayName: "Worker One · Pi",
+        role: "member",
+      });
+    }
+
+    // 3. Leader reads board at revision 2
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+        }),
+      });
+
+      handlePetTeamBoardReadPost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_read");
+      assert.equal(body.status, "active");
+      assert.equal(body.board.revision, 2);
+      assert.equal(body.board.markdown, "# Roadmap\n- [x] Task 1 done");
+      assert.deepEqual(body.board.updatedBy, {
+        displayName: "Worker One · Pi",
+        role: "member",
+      });
+    }
+
+    // 4. Fallback displayName when session snapshot has no matching session
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+        }),
+      });
+
+      handlePetTeamBoardReadPost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: [], // empty sessions
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.deepEqual(body.board.updatedBy, {
+        displayName: "Team member",
+        role: "member",
+      });
+    }
+  });
+
+  test("observer member cannot write to board (403) but can read board (200)", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "Audited Team",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "observer" }],
+      actor: { kind: "user" },
+    });
+
+    // Observer can read
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: target1Raw,
+          capabilityToken: target1Token,
+        }),
+      });
+
+      handlePetTeamBoardReadPost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.status, "active");
+      assert.equal(body.board.revision, 0);
+    }
+
+    // Observer write is rejected with 403
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: target1Raw,
+          capabilityToken: target1Token,
+          baseRevision: 0,
+          markdown: "# Observer edit",
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 403);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "rejected");
+      assert.ok(body.reason.includes("Observer"));
+    }
+  });
+
+  test("OCC revision mismatch returns 409 and currentRevision", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "OCC Squad",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+
+    // 1. Advance to rev 1
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+          baseRevision: 0,
+          markdown: "Rev 1",
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 200);
+    }
+
+    // 2. Member tries to write with stale baseRevision 0
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: target1Raw,
+          capabilityToken: target1Token,
+          baseRevision: 0,
+          markdown: "Stale write",
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 409);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "conflict");
+      assert.equal(body.currentRevision, 1);
+      assert.ok(body.reason.includes("Revision mismatch"));
+    }
+  });
+
+  test("oversized markdown (> 8192 UTF-8 bytes) returns 413", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "Size Test Squad",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+
+    // 8193 bytes ASCII
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+          baseRevision: 0,
+          markdown: "A".repeat(8193),
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 413);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "rejected");
+      assert.ok(body.reason.includes("8192"));
+    }
+
+    // Multibyte emojis exceeding 8192 bytes (2731 * 3 = 8193 bytes)
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+          baseRevision: 0,
+          markdown: "✨".repeat(2731),
+        }),
+      });
+
+      handlePetTeamBoardWritePost(req, res, {
+        peerCapabilityRegistry: registry,
+        peerHandleStore: handleStore,
+        teamStore,
+        derivePetId,
+        sessions: getSessions(),
+        env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+      });
+
+      await result.done;
+      assert.equal(result.statusCode, 413);
+      const body = JSON.parse(result.body);
+      assert.equal(body.schemaVersion, "1");
+      assert.equal(body.kind, "team_board_write");
+      assert.equal(body.status, "rejected");
+    }
+  });
+
+  test("board projection never leaks teamId, petId, rawSessionId, capabilityToken, or file paths", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    const createResult = teamStore.createTeam({
+      name: "Leak Test Squad",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+    const internalTeamId = createResult.team.teamId;
+
+    // 1. Write
+    const { res: writeRes, result: writeResult } = createMockRes();
+    const writeReq = createMockReq({
+      url: "/pet-team/board/write",
+      body: JSON.stringify({
+        schemaVersion: "1",
+        kind: "team_board_write",
+        rawSessionId: callerRaw,
+        capabilityToken: callerToken,
+        baseRevision: 0,
+        markdown: "Hello Secret Free World",
+      }),
+    });
+
+    handlePetTeamBoardWritePost(writeReq, writeRes, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+      env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+    });
+
+    await writeResult.done;
+    assert.equal(writeResult.statusCode, 200);
+    const writeBody = writeResult.body;
+    assert.equal(writeBody.includes(internalTeamId), false);
+    assert.equal(writeBody.includes(callerPetId), false);
+    assert.equal(writeBody.includes(target1PetId), false);
+    assert.equal(writeBody.includes(callerRaw), false);
+    assert.equal(writeBody.includes(callerToken), false);
+    assert.equal(writeBody.includes(tmpDataDir), false);
+
+    // 2. Read
+    const { res: readRes, result: readResult } = createMockRes();
+    const readReq = createMockReq({
+      url: "/pet-team/board/read",
+      body: JSON.stringify({
+        schemaVersion: "1",
+        kind: "team_board_read",
+        rawSessionId: callerRaw,
+        capabilityToken: callerToken,
+      }),
+    });
+
+    handlePetTeamBoardReadPost(readReq, readRes, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+      env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+    });
+
+    await readResult.done;
+    assert.equal(readResult.statusCode, 200);
+    const readBody = readResult.body;
+    assert.equal(readBody.includes(internalTeamId), false);
+    assert.equal(readBody.includes(callerPetId), false);
+    assert.equal(readBody.includes(target1PetId), false);
+    assert.equal(readBody.includes(callerRaw), false);
+    assert.equal(readBody.includes(callerToken), false);
+    assert.equal(readBody.includes(tmpDataDir), false);
+  });
+
+  test("injectable and lazy store resolution", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+
+    teamStore.createTeam({
+      name: "Store Resolution Squad",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+
+    // 1. Explicit mock teamBoardStore in options
+    let customReadCalled = false;
+    const mockBoardStore = {
+      readBoard: () => {
+        customReadCalled = true;
+        return {
+          ok: true,
+          board: {
+            schemaVersion: "1",
+            teamId: "mock_team",
+            revision: 42,
+            markdown: "Custom Mock Markdown",
+            updatedAtMs: 12345678,
+            updatedByPetId: callerPetId,
+          },
+        };
+      },
+      writeBoard: () => ({ ok: true, board: { schemaVersion: "1", teamId: "mock", revision: 1, markdown: "ok" } }),
+    };
+
+    const { res: res1, result: result1 } = createMockRes();
+    handlePetTeamBoardReadPost(
+      createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+        }),
+      }),
+      res1,
+      {
+        peerCapabilityRegistry: registry,
+        teamStore,
+        derivePetId,
+        teamBoardStore: mockBoardStore,
+      }
+    );
+
+    await result1.done;
+    assert.equal(result1.statusCode, 200);
+    assert.equal(customReadCalled, true);
+    const body1 = JSON.parse(result1.body);
+    assert.equal(body1.board.revision, 42);
+    assert.equal(body1.board.markdown, "Custom Mock Markdown");
+
+    // 2. Injected via ctx.teamBoardStore
+    let ctxReadCalled = false;
+    const ctxMockBoardStore = {
+      readBoard: () => {
+        ctxReadCalled = true;
+        return {
+          ok: true,
+          board: {
+            schemaVersion: "1",
+            teamId: "ctx_team",
+            revision: 99,
+            markdown: "Ctx Markdown",
+          },
+        };
+      },
+      writeBoard: () => ({ ok: true }),
+    };
+
+    const { res: res2, result: result2 } = createMockRes();
+    handlePetTeamBoardReadPost(
+      createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: callerRaw,
+          capabilityToken: callerToken,
+        }),
+      }),
+      res2,
+      {
+        ctx: {
+          peerCapabilityRegistry: registry,
+          teamStore,
+          derivePetId,
+          teamBoardStore: ctxMockBoardStore,
+        },
+      }
+    );
+
+    await result2.done;
+    assert.equal(result2.statusCode, 200);
+    assert.equal(ctxReadCalled, true);
+    const body2 = JSON.parse(result2.body);
+    assert.equal(body2.board.revision, 99);
+
+    // 3. Production-style lazy resolution uses a complete explicit env.
+    const lazyStore = resolveTeamBoardStore({
+      teamStore,
+      env: { ...process.env, PI_PET_DATA_DIR: tmpDataDir },
+    });
+    assert.equal(typeof lazyStore.readBoard, "function");
+    assert.equal(typeof lazyStore.writeBoard, "function");
+
+    // 4. An explicitly injected partial env remains an isolation boundary;
+    // it must not inherit the runtime module path from process.env.
+    const isolatedStore = resolveTeamBoardStore({
+      teamStore,
+      env: { PI_PET_DATA_DIR: tmpDataDir },
+    });
+    assert.equal(isolatedStore, null);
+  });
+
+  test("auth verification failure on invalid capabilityToken or invalid profileId", async () => {
+    // 1. Invalid capability token on read -> 403
+    {
+      const { res, result } = createMockRes();
+      handlePetTeamBoardReadPost(
+        createMockReq({
+          url: "/pet-team/board/read",
+          body: JSON.stringify({
+            schemaVersion: "1",
+            kind: "team_board_read",
+            rawSessionId: callerRaw,
+            capabilityToken: generateToken(), // unauthenticated token
+          }),
+        }),
+        res,
+        {
+          peerCapabilityRegistry: registry,
+          teamStore,
+          derivePetId,
+        }
+      );
+
+      await result.done;
+      assert.equal(result.statusCode, 403);
+    }
+
+    // 2. Invalid capability token on write -> 403
+    {
+      const { res, result } = createMockRes();
+      handlePetTeamBoardWritePost(
+        createMockReq({
+          url: "/pet-team/board/write",
+          body: JSON.stringify({
+            schemaVersion: "1",
+            kind: "team_board_write",
+            rawSessionId: callerRaw,
+            capabilityToken: generateToken(), // unauthenticated token
+            baseRevision: 0,
+            markdown: "foo",
+          }),
+        }),
+        res,
+        {
+          peerCapabilityRegistry: registry,
+          teamStore,
+          derivePetId,
+        }
+      );
+
+      await result.done;
+      assert.equal(result.statusCode, 403);
+    }
+
+    // 3. Invalid profileId on read -> 403
+    {
+      const { res, result } = createMockRes();
+      handlePetTeamBoardReadPost(
+        createMockReq({
+          url: "/pet-team/board/read",
+          body: JSON.stringify({
+            schemaVersion: "1",
+            kind: "team_board_read",
+            rawSessionId: callerRaw,
+            capabilityToken: callerToken,
+          }),
+        }),
+        res,
+        {
+          remoteProfile: { profileId: "invalid/profile" },
+          peerCapabilityRegistry: registry,
+          teamStore,
+          derivePetId,
+        }
+      );
+
+      await result.done;
+      assert.equal(result.statusCode, 403);
+    }
+  });
+
+  test("rejects board request larger than 16 KiB", async () => {
+    const hugeBody = JSON.stringify({
+      schemaVersion: "1",
+      kind: "team_board_read",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      padding: "X".repeat(20000),
+    });
+
+    const { res, result } = createMockRes();
+    const req = createMockReq({
+      url: "/pet-team/board/read",
+      body: hugeBody,
+    });
+
+    handlePetTeamBoardReadPost(req, res, {
+      peerCapabilityRegistry: registry,
+      teamStore,
+      derivePetId,
+    });
+
+    await result.done;
+    assert.equal(result.statusCode, 413);
+  });
 });
 
 describe("Remote SSH Ingress Routing for Team Endpoints", () => {
   const nonce = "0123456789abcdef0123456789abcdef";
 
-  test("remote SSH ingress allows /pet-team/status, /pet-team/create, /pet-team/dissolve with valid routing nonce", async () => {
+  test("remote SSH ingress allows team and board endpoints with valid routing nonce", async () => {
     let routedUrl = null;
     let routedProfile = null;
 
@@ -688,7 +1547,13 @@ describe("Remote SSH Ingress Routing for Team Endpoints", () => {
       },
     });
 
-    for (const pathName of ["/pet-team/status", "/pet-team/create", "/pet-team/dissolve"]) {
+    for (const pathName of [
+      "/pet-team/status",
+      "/pet-team/create",
+      "/pet-team/dissolve",
+      "/pet-team/board/read",
+      "/pet-team/board/write",
+    ]) {
       routedUrl = null;
       routedProfile = null;
 
@@ -716,6 +1581,110 @@ describe("Remote SSH Ingress Routing for Team Endpoints", () => {
       handler(reqNoNonce, resNoNonce);
       await resNoNonceResult.done;
       assert.equal(resNoNonceResult.statusCode, 404);
+    }
+  });
+});
+
+describe("Server Routing Dispatch for Board Endpoints", () => {
+  let tmpDir;
+  let tStore;
+  let pRegistry;
+  let bStore;
+  let cToken;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-pet-server-team-test-"));
+    tStore = createTeamStore({ env: { PI_PET_DATA_DIR: tmpDir } });
+    bStore = createTeamBoardStore({ teamStore: tStore, env: { PI_PET_DATA_DIR: tmpDir } });
+    pRegistry = createPetPeerCapabilityRegistry();
+    cToken = generateToken();
+    pRegistry.registerCapability({ profileId: "local", agentId: "pi", rawSessionId: "session-srv", token: cToken });
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  test("initServer dispatches POST /pet-team/board/read and /pet-team/board/write", async () => {
+    let capturedHandler = null;
+    const fakeCreateHttpServer = (handler) => {
+      capturedHandler = handler;
+      const { EventEmitter } = require("events");
+      const server = new EventEmitter();
+      server.listen = function () { this.emit("listening"); };
+      server.close = function () {};
+      return server;
+    };
+
+    const srv = initServer({
+      createHttpServer: fakeCreateHttpServer,
+      setImmediate: () => {},
+      getPortCandidates: () => [23334],
+      readRuntimePort: () => 23334,
+      clearRuntimeConfig: () => true,
+      writeRuntimeConfig: () => true,
+      isAgentEnabled: () => true,
+      teamStore: tStore,
+      teamBoardStore: bStore,
+      derivePetId,
+      petPeerCapabilityRegistry: pRegistry,
+    });
+
+    srv.startHttpServer();
+    assert.ok(capturedHandler, "Handler should be captured");
+
+    // Create team for caller
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: "session-srv" });
+    tStore.createTeam({
+      name: "Server Dispatch Team",
+      leaderPetId: callerPetId,
+      members: [],
+      actor: { kind: "user" },
+    });
+
+    // Write through initServer captured handler
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/write",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_write",
+          rawSessionId: "session-srv",
+          capabilityToken: cToken,
+          baseRevision: 0,
+          markdown: "Dispatched through server.js",
+        }),
+      });
+      capturedHandler(req, res);
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.status, "updated");
+      assert.equal(body.board.revision, 1);
+    }
+
+    // Read through initServer captured handler
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/board/read",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_board_read",
+          rawSessionId: "session-srv",
+          capabilityToken: cToken,
+        }),
+      });
+      capturedHandler(req, res);
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.status, "active");
+      assert.equal(body.board.revision, 1);
+      assert.equal(body.board.markdown, "Dispatched through server.js");
     }
   });
 });

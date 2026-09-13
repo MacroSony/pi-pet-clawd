@@ -82,6 +82,8 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
       req.url === "/pet-team/status"
       || req.url === "/pet-team/create"
       || req.url === "/pet-team/dissolve"
+      || req.url === "/pet-team/board/read"
+      || req.url === "/pet-team/board/write"
     );
     const nonce = (isPetExpression || isPetInboxClaim || isPetInboxSettle || isPetPeerEndpoint || isPetTeamEndpoint)
       ? headerValue

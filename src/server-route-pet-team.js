@@ -17,6 +17,7 @@ const MAX_TEAM_NAME_CODE_POINTS = 80;
 const MIN_TEAM_NAME_CODE_POINTS = 1;
 const MAX_TEAM_TARGETS = 7;
 const MIN_TEAM_TARGETS = 1;
+const MAX_BOARD_MARKDOWN_BYTES = 8192; // 8 KiB
 
 const ALLOWED_TEAM_STATUS_KEYS = Object.freeze(new Set([
   "schemaVersion",
@@ -41,7 +42,24 @@ const ALLOWED_TEAM_DISSOLVE_KEYS = Object.freeze(new Set([
   "capabilityToken",
 ]));
 
+const ALLOWED_TEAM_BOARD_READ_KEYS = Object.freeze(new Set([
+  "schemaVersion",
+  "kind",
+  "rawSessionId",
+  "capabilityToken",
+]));
+
+const ALLOWED_TEAM_BOARD_WRITE_KEYS = Object.freeze(new Set([
+  "schemaVersion",
+  "kind",
+  "rawSessionId",
+  "capabilityToken",
+  "baseRevision",
+  "markdown",
+]));
+
 const C0_C1_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]/;
+const DISALLOWED_BOARD_MARKDOWN_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
 
 function validateBasePayload(data, allowedKeys, expectedKind) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
@@ -99,16 +117,62 @@ function validatePetTeamDissolvePayload(data) {
   return validateBasePayload(data, ALLOWED_TEAM_DISSOLVE_KEYS, "team_dissolve");
 }
 
+function validatePetTeamBoardReadPayload(data) {
+  return validateBasePayload(data, ALLOWED_TEAM_BOARD_READ_KEYS, "team_board_read");
+}
+
+function validatePetTeamBoardWritePayload(data) {
+  const baseValidation = validateBasePayload(data, ALLOWED_TEAM_BOARD_WRITE_KEYS, "team_board_write");
+  if (!baseValidation.ok) return baseValidation;
+
+  if (typeof data.baseRevision !== "number" || !Number.isSafeInteger(data.baseRevision) || data.baseRevision < 0) {
+    return { ok: false, reason: "baseRevision must be a non-negative safe integer" };
+  }
+
+  if (typeof data.markdown !== "string") {
+    return { ok: false, reason: "markdown must be a string" };
+  }
+
+  if (DISALLOWED_BOARD_MARKDOWN_CONTROL_RE.test(data.markdown)) {
+    return { ok: false, reason: "markdown contains disallowed control characters" };
+  }
+
+  return { ok: true };
+}
+
 function resolveTeamStore(options = {}) {
   const { ctx, teamStore, env } = options;
   if (teamStore && typeof teamStore.createTeam === "function") return teamStore;
   if (ctx && ctx.teamStore && typeof ctx.teamStore.createTeam === "function") return ctx.teamStore;
   try {
-    const runtime = loadRuntime(env || (ctx && ctx.env) || process.env);
+    const runtimeEnv = env || (ctx && ctx.env) || process.env;
+    const runtime = loadRuntime(runtimeEnv);
     if (runtime && typeof runtime.createTeamStore === "function") {
       // The store is a synchronous facade over coordinator-owned files; no
       // object-local mutable authority is required between requests.
-      return runtime.createTeamStore({ env: env || (ctx && ctx.env) || process.env });
+      return runtime.createTeamStore({ env: runtimeEnv });
+    }
+  } catch {}
+  return null;
+}
+
+function resolveTeamBoardStore(options = {}) {
+  const { ctx, teamBoardStore, env } = options;
+  if (teamBoardStore && typeof teamBoardStore.readBoard === "function" && typeof teamBoardStore.writeBoard === "function") {
+    return teamBoardStore;
+  }
+  if (ctx && ctx.teamBoardStore && typeof ctx.teamBoardStore.readBoard === "function" && typeof ctx.teamBoardStore.writeBoard === "function") {
+    return ctx.teamBoardStore;
+  }
+  try {
+    const runtimeEnv = env || (ctx && ctx.env) || process.env;
+    const runtime = loadRuntime(runtimeEnv);
+    if (runtime && typeof runtime.createTeamBoardStore === "function") {
+      const resolvedTeamStore = resolveTeamStore(options);
+      return runtime.createTeamBoardStore({
+        teamStore: resolvedTeamStore || undefined,
+        env: runtimeEnv,
+      });
     }
   } catch {}
   return null;
@@ -119,7 +183,8 @@ function resolveDerivePetId(options = {}) {
   if (typeof derivePetId === "function") return derivePetId;
   if (ctx && typeof ctx.derivePetId === "function") return ctx.derivePetId;
   try {
-    const runtime = loadRuntime(env || (ctx && ctx.env) || process.env);
+    const runtimeEnv = env || (ctx && ctx.env) || process.env;
+    const runtime = loadRuntime(runtimeEnv);
     if (runtime && typeof runtime.derivePetId === "function") return runtime.derivePetId;
   } catch {}
   return null;
@@ -331,6 +396,71 @@ function buildSanitizedTeamProjection({
   }
 
   return { name: team.name, revision: team.revision, callerRole, members: sanitizedMembers };
+}
+
+function buildSanitizedBoardProjection({
+  board,
+  team,
+  candidateSessions = [],
+  derivePetId,
+}) {
+  const projected = {
+    revision: (board && typeof board.revision === "number" && Number.isSafeInteger(board.revision) && board.revision >= 0)
+      ? board.revision
+      : 0,
+    markdown: (board && typeof board.markdown === "string") ? board.markdown : "",
+  };
+
+  if (board && typeof board.updatedAtMs === "number" && Number.isSafeInteger(board.updatedAtMs) && board.updatedAtMs >= 0) {
+    projected.updatedAtMs = board.updatedAtMs;
+  }
+
+  if (board && typeof board.updatedByPetId === "string" && board.updatedByPetId.trim()) {
+    const updatedByPetId = board.updatedByPetId.trim();
+    let memberRole = null;
+    if (team && Array.isArray(team.members)) {
+      const member = team.members.find((m) => m && m.petId === updatedByPetId);
+      if (member && typeof member.role === "string" && member.role.trim()) {
+        memberRole = member.role.trim();
+      }
+    }
+    if (!memberRole && team && team.leaderPetId === updatedByPetId) {
+      memberRole = "leader";
+    }
+    const role = memberRole || "member";
+
+    let matchingSession = null;
+    if (Array.isArray(candidateSessions) && typeof derivePetId === "function") {
+      for (const session of candidateSessions) {
+        if (!session || typeof session !== "object") continue;
+        const sProfileId = (typeof session.profileId === "string" && session.profileId.trim()) ? session.profileId : "local";
+        const sRawSessionId = session.rawSessionId || session.id;
+        if (!sRawSessionId) continue;
+        try {
+          const sPetId = derivePetId({ profileId: sProfileId, agentId: "pi", rawSessionId: sRawSessionId });
+          if (sPetId === updatedByPetId) {
+            matchingSession = session;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    let displayName = "Team member";
+    if (matchingSession) {
+      const rawName = matchingSession.displayTitle || matchingSession.sessionTitle || matchingSession.agentName;
+      if (rawName && typeof rawName === "string" && rawName.trim()) {
+        displayName = sanitizeDisplayName(rawName);
+      }
+    }
+
+    projected.updatedBy = {
+      displayName,
+      role,
+    };
+  }
+
+  return projected;
 }
 
 function handlePetTeamStatusPost(req, res, options = {}) {
@@ -575,22 +705,213 @@ function handlePetTeamDissolvePost(req, res, options = {}) {
   });
 }
 
+function handlePetTeamBoardReadPost(req, res, options = {}) {
+  readJsonBody(req, res, validatePetTeamBoardReadPayload, (data) => {
+    const auth = authenticateTeamRequest(req, res, options, data);
+    if (!auth) return;
+
+    const { teamStore, derivePetId, callerPetId } = auth;
+    const teams = teamStore.listTeamsForPet({ petId: callerPetId });
+    const activeTeams = Array.isArray(teams) ? teams.filter((t) => t && t.status === "active") : [];
+
+    if (activeTeams.length === 0) {
+      sendJsonResponse(res, 200, {
+        schemaVersion: "1",
+        kind: "team_board_read",
+        status: "none",
+      });
+      return;
+    }
+
+    const activeTeam = activeTeams[0];
+    const boardStore = resolveTeamBoardStore(options);
+    if (!boardStore || typeof boardStore.readBoard !== "function") {
+      sendJsonResponse(res, 503, { status: "failed", reason: "Runtime team board store unavailable" });
+      return;
+    }
+
+    const readResult = boardStore.readBoard({
+      teamId: activeTeam.teamId,
+      actor: { kind: "member", petId: callerPetId },
+    });
+
+    if (!readResult || !readResult.ok) {
+      if (readResult && readResult.error === "forbidden") {
+        sendJsonResponse(res, 403, {
+          schemaVersion: "1",
+          kind: "team_board_read",
+          status: "rejected",
+          reason: readResult.reason || "Forbidden",
+        });
+        return;
+      }
+      sendJsonResponse(res, 500, {
+        schemaVersion: "1",
+        kind: "team_board_read",
+        status: "failed",
+        reason: (readResult && readResult.reason) || "Board read failed",
+      });
+      return;
+    }
+
+    const candidateSessions = getCandidateSessions(options);
+    const projectedBoard = buildSanitizedBoardProjection({
+      board: readResult.board,
+      team: activeTeam,
+      candidateSessions: candidateSessions || [],
+      derivePetId,
+    });
+
+    sendJsonResponse(res, 200, {
+      schemaVersion: "1",
+      kind: "team_board_read",
+      status: "active",
+      board: projectedBoard,
+    });
+  });
+}
+
+function handlePetTeamBoardWritePost(req, res, options = {}) {
+  readJsonBody(req, res, validatePetTeamBoardWritePayload, (data) => {
+    if (Buffer.byteLength(data.markdown, "utf8") > MAX_BOARD_MARKDOWN_BYTES) {
+      sendJsonResponse(res, 413, {
+        schemaVersion: "1",
+        kind: "team_board_write",
+        status: "rejected",
+        reason: `markdown byte length exceeds maximum ${MAX_BOARD_MARKDOWN_BYTES} bytes`,
+      });
+      return;
+    }
+
+    const auth = authenticateTeamRequest(req, res, options, data);
+    if (!auth) return;
+
+    const { teamStore, derivePetId, callerPetId } = auth;
+    const teams = teamStore.listTeamsForPet({ petId: callerPetId });
+    const activeTeams = Array.isArray(teams) ? teams.filter((t) => t && t.status === "active") : [];
+
+    if (activeTeams.length === 0) {
+      sendJsonResponse(res, 404, {
+        schemaVersion: "1",
+        kind: "team_board_write",
+        status: "rejected",
+        reason: "Caller does not belong to any active team",
+      });
+      return;
+    }
+
+    const activeTeam = activeTeams[0];
+    const boardStore = resolveTeamBoardStore(options);
+    if (!boardStore || typeof boardStore.writeBoard !== "function") {
+      sendJsonResponse(res, 503, { status: "failed", reason: "Runtime team board store unavailable" });
+      return;
+    }
+
+    const writeResult = boardStore.writeBoard({
+      teamId: activeTeam.teamId,
+      actor: { kind: "member", petId: callerPetId },
+      baseRevision: data.baseRevision,
+      markdown: data.markdown,
+    });
+
+    if (!writeResult || !writeResult.ok) {
+      if (writeResult && writeResult.error === "conflict") {
+        sendJsonResponse(res, 409, {
+          schemaVersion: "1",
+          kind: "team_board_write",
+          status: "conflict",
+          reason: writeResult.reason || "Revision mismatch",
+          currentRevision: typeof writeResult.currentRevision === "number" ? writeResult.currentRevision : 0,
+        });
+        return;
+      }
+      if (writeResult && writeResult.error === "markdown_too_large") {
+        sendJsonResponse(res, 413, {
+          schemaVersion: "1",
+          kind: "team_board_write",
+          status: "rejected",
+          reason: writeResult.reason || `markdown byte length exceeds maximum ${MAX_BOARD_MARKDOWN_BYTES} bytes`,
+        });
+        return;
+      }
+      if (writeResult && writeResult.error === "forbidden") {
+        sendJsonResponse(res, 403, {
+          schemaVersion: "1",
+          kind: "team_board_write",
+          status: "rejected",
+          reason: writeResult.reason || "Forbidden",
+        });
+        return;
+      }
+      if (writeResult && (writeResult.error === "team_not_found" || writeResult.error === "team_not_active")) {
+        sendJsonResponse(res, 404, {
+          schemaVersion: "1",
+          kind: "team_board_write",
+          status: "rejected",
+          reason: writeResult.reason || "Active team not found",
+        });
+        return;
+      }
+      if (writeResult && (writeResult.error === "invalid_markdown" || writeResult.error === "invalid_revision" || writeResult.error === "invalid_options")) {
+        sendJsonResponse(res, 400, {
+          schemaVersion: "1",
+          kind: "team_board_write",
+          status: "rejected",
+          reason: writeResult.reason || "Invalid request",
+        });
+        return;
+      }
+      sendJsonResponse(res, 500, {
+        schemaVersion: "1",
+        kind: "team_board_write",
+        status: "failed",
+        reason: (writeResult && writeResult.reason) || "Board write failed",
+      });
+      return;
+    }
+
+    const candidateSessions = getCandidateSessions(options);
+    const projectedBoard = buildSanitizedBoardProjection({
+      board: writeResult.board,
+      team: activeTeam,
+      candidateSessions: candidateSessions || [],
+      derivePetId,
+    });
+
+    sendJsonResponse(res, 200, {
+      schemaVersion: "1",
+      kind: "team_board_write",
+      status: "updated",
+      board: projectedBoard,
+    });
+  });
+}
+
 module.exports = {
   MAX_PET_TEAM_BODY_BYTES,
   MAX_TEAM_NAME_CODE_POINTS,
   MIN_TEAM_NAME_CODE_POINTS,
   MAX_TEAM_TARGETS,
   MIN_TEAM_TARGETS,
+  MAX_BOARD_MARKDOWN_BYTES,
   ALLOWED_TEAM_STATUS_KEYS,
   ALLOWED_TEAM_CREATE_KEYS,
   ALLOWED_TEAM_DISSOLVE_KEYS,
+  ALLOWED_TEAM_BOARD_READ_KEYS,
+  ALLOWED_TEAM_BOARD_WRITE_KEYS,
   validatePetTeamStatusPayload,
   validatePetTeamCreatePayload,
   validatePetTeamDissolvePayload,
+  validatePetTeamBoardReadPayload,
+  validatePetTeamBoardWritePayload,
   buildSanitizedTeamProjection,
+  buildSanitizedBoardProjection,
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
   handlePetTeamDissolvePost,
+  handlePetTeamBoardReadPost,
+  handlePetTeamBoardWritePost,
   resolveTeamStore,
+  resolveTeamBoardStore,
   resolveDerivePetId,
 };

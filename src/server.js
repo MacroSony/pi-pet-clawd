@@ -71,6 +71,8 @@ const {
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
   handlePetTeamDissolvePost,
+  handlePetTeamBoardReadPost,
+  handlePetTeamBoardWritePost,
 } = require("./server-route-pet-team");
 const { createRemoteSshIngress } = require("./remote-ssh-ingress");
 const {
@@ -886,6 +888,28 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         peerHandleStore: petPeerHandleStore,
         getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
         teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/board/read") {
+      handlePetTeamBoardReadPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        teamBoardStore: typeof ctx.teamBoardStore === "object" ? ctx.teamBoardStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/board/write") {
+      handlePetTeamBoardWritePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        teamBoardStore: typeof ctx.teamBoardStore === "object" ? ctx.teamBoardStore : undefined,
         derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
     } else {
