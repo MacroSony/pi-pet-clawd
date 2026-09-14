@@ -568,10 +568,14 @@ function createChatTurnTracker({
     pendingOrigins = pendingOrigins.filter((origin) => origin.commandId !== commandId);
   }
 
+  function getCandidateCompletionText(candidate) {
+    if (!candidate || candidate.status !== "active") return "";
+    return candidate.expressText || candidate.assistantText || "";
+  }
+
   function finalizeCandidate(candidate) {
-    if (!candidate || candidate.status !== "active" || typeof candidate.assistantText !== "string" || !candidate.assistantText) {
-      return;
-    }
+    const assistantText = getCandidateCompletionText(candidate);
+    if (!assistantText) return;
     const rawSessionId = candidate.rawSessionId || (typeof getRawSessionId === "function" ? getRawSessionId() : "pi:default");
     if (!isStartableRawSessionId(rawSessionId) || !isValidCapabilityToken(peerCapabilityToken) || !isUsableRemoteIdentity(identity)) {
       return;
@@ -582,7 +586,7 @@ function createChatTurnTracker({
       rawSessionId,
       capabilityToken: peerCapabilityToken,
       commandId: candidate.commandId,
-      assistantText: candidate.assistantText,
+      assistantText,
     };
     try {
       const p = postJson({
@@ -635,7 +639,7 @@ function createChatTurnTracker({
 
     if (role === "user") {
       if (activeCandidate) {
-        if (activeCandidate.status === "active" && activeCandidate.assistantText) {
+        if (getCandidateCompletionText(activeCandidate)) {
           finalizeCandidate(activeCandidate);
         }
         activeCandidate = null;
@@ -663,6 +667,7 @@ function createChatTurnTracker({
           userText: matched.text,
           rawSessionId: matched.rawSessionId || currentRawSession,
           assistantText: "",
+          expressText: "",
           status: "active",
           dispatchedAtMs: matched.dispatchedAtMs,
         };
@@ -677,6 +682,8 @@ function createChatTurnTracker({
 
       if (isErrorOrAborted(event, msg)) {
         activeCandidate.status = "error";
+        activeCandidate.assistantText = "";
+        activeCandidate.expressText = "";
         return;
       }
 
@@ -685,6 +692,15 @@ function createChatTurnTracker({
         activeCandidate.assistantText = text;
       }
     }
+  }
+
+  function noteDeliveredExpression({ status, text, rawSessionId } = {}) {
+    if (status !== "delivered" || !activeCandidate || activeCandidate.status !== "active") return false;
+    if (rawSessionId && activeCandidate.rawSessionId && rawSessionId !== activeCandidate.rawSessionId) return false;
+    const cleaned = sanitizeChatAssistantText(text);
+    if (!cleaned) return false;
+    activeCandidate.expressText = cleaned;
+    return true;
   }
 
   function handleAgentEnd(event, ctx) {
@@ -696,7 +712,7 @@ function createChatTurnTracker({
       return;
     }
 
-    if (activeCandidate.status === "active" && activeCandidate.assistantText) {
+    if (getCandidateCompletionText(activeCandidate)) {
       finalizeCandidate(activeCandidate);
     }
     activeCandidate = null;
@@ -713,6 +729,7 @@ function createChatTurnTracker({
     discardDispatchedUserMessage,
     handleInput,
     handleMessageEnd,
+    noteDeliveredExpression,
     handleAgentEnd,
     reset,
     clear: reset,
@@ -1767,6 +1784,18 @@ function attach(pi, deps = {}) {
   pi.on("tool_result", (nativeEvent, ctx) => {
     rememberContext(ctx);
     const isError = !!(nativeEvent && nativeEvent.isError);
+    if (
+      !isError && nativeEvent && nativeEvent.toolName === "pet_express" &&
+      nativeEvent.details && nativeEvent.details.status === "delivered" &&
+      nativeEvent.input && typeof nativeEvent.input.text === "string" &&
+      tracker && typeof tracker.noteDeliveredExpression === "function"
+    ) {
+      tracker.noteDeliveredExpression({
+        status: nativeEvent.details.status,
+        text: nativeEvent.input.text,
+        rawSessionId: getCanonicalRawSessionId(ctx),
+      });
+    }
     // Await failed tool delivery so a following lifecycle event cannot hide
     // the error state before Clawd receives it.
     return send(

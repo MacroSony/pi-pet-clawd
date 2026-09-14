@@ -843,6 +843,60 @@ describe("Managed remote Pi chat correlation", () => {
     attached.stopHeartbeat();
   });
 
+  it("prefers the last successfully delivered pet_express text over final assistant text", async () => {
+    const httpPosts = [];
+    const handlers = {};
+    const pi = {
+      on(name, handler) {
+        handlers[name] = handler;
+      },
+      sendUserMessage() {
+        return Promise.resolve();
+      },
+    };
+    const attached = attachForChat(pi, {
+      remoteIdentity: validRemoteIdentity,
+      peerCapabilityToken: testPeerToken,
+      capabilityToken: testCapabilityToken,
+      httpRequest: createMockHttpCapture(httpPosts),
+      shouldReport: () => true,
+      postState: () => Promise.resolve(true),
+    });
+    const tracker = attached.getTracker();
+    const ctx = makeCtx({ sessionManager: { getSessionId: () => "sess-express" } });
+
+    await handlers.session_start({}, ctx);
+    tracker.noteDispatchedUserMessage({
+      commandId: "cmd-express",
+      text: "摸摸头喵",
+      rawSessionId: "pi:sess-express",
+      dispatchedAtMs: 1000,
+    });
+    handlers.input({ source: "extension", text: "摸摸头喵" }, ctx);
+    handlers.message_end({ message: { role: "user", content: "摸摸头喵", timestamp: 1001 } }, ctx);
+
+    await handlers.tool_result({
+      type: "tool_result",
+      toolCallId: "express-1",
+      toolName: "pet_express",
+      input: { text: "蹭蹭～被摸头好开心喵！", emotion: "happy" },
+      details: { status: "delivered" },
+      content: [{ type: "text", text: "Expressed on desktop pet" }],
+      isError: false,
+    }, ctx);
+    handlers.message_end({
+      message: { role: "assistant", content: [{ type: "text", text: "蹭蹭～好开心喵！" }] },
+    }, ctx);
+    await handlers.agent_end({}, ctx);
+
+    const completePosts = httpPosts.filter((post) => post.path === "/pet-chat/complete");
+    assert.strictEqual(completePosts.length, 1);
+    assert.strictEqual(completePosts[0].body.commandId, "cmd-express");
+    assert.strictEqual(completePosts[0].body.assistantText, "蹭蹭～被摸头好开心喵！");
+
+    attached.stopHeartbeat();
+  });
+
   it("interactive input isolation: interactive user inputs never trigger chat complete posts", async () => {
     const httpPosts = [];
     const httpRequest = createMockHttpCapture(httpPosts);
