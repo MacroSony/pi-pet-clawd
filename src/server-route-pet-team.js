@@ -35,6 +35,22 @@ const ALLOWED_TEAM_CREATE_KEYS = Object.freeze(new Set([
   "targets",
 ]));
 
+const ALLOWED_TEAM_ADD_KEYS = Object.freeze(new Set([
+  "schemaVersion",
+  "kind",
+  "rawSessionId",
+  "capabilityToken",
+  "target",
+]));
+
+const ALLOWED_TEAM_REMOVE_KEYS = Object.freeze(new Set([
+  "schemaVersion",
+  "kind",
+  "rawSessionId",
+  "capabilityToken",
+  "member",
+]));
+
 const ALLOWED_TEAM_DISSOLVE_KEYS = Object.freeze(new Set([
   "schemaVersion",
   "kind",
@@ -108,6 +124,28 @@ function validatePetTeamCreatePayload(data) {
     }
     if (seenHandles.has(target)) return { ok: false, reason: "Duplicate target handle in targets array" };
     seenHandles.add(target);
+  }
+
+  return { ok: true };
+}
+
+function validatePetTeamAddPayload(data) {
+  const baseValidation = validateBasePayload(data, ALLOWED_TEAM_ADD_KEYS, "team_add");
+  if (!baseValidation.ok) return baseValidation;
+
+  if (typeof data.target !== "string" || !/^psh_[A-Za-z0-9_-]{1,124}$/.test(data.target)) {
+    return { ok: false, reason: "target must be a valid psh_ handle string" };
+  }
+
+  return { ok: true };
+}
+
+function validatePetTeamRemovePayload(data) {
+  const baseValidation = validateBasePayload(data, ALLOWED_TEAM_REMOVE_KEYS, "team_remove");
+  if (!baseValidation.ok) return baseValidation;
+
+  if (typeof data.member !== "string" || !/^pmh_[A-Za-z0-9_-]{1,124}$/.test(data.member)) {
+    return { ok: false, reason: "member must be a valid pmh_ handle string" };
   }
 
   return { ok: true };
@@ -205,6 +243,29 @@ function getCandidateSessions(options = {}) {
   }
   if (Array.isArray(sessions)) return sessions;
   if (ctx && Array.isArray(ctx.sessions)) return ctx.sessions;
+  return null;
+}
+
+function findEligibleCandidateSession(candidateSessions, identity) {
+  if (!Array.isArray(candidateSessions) || !identity || typeof identity !== "object") return null;
+  for (const session of candidateSessions) {
+    if (!session || typeof session !== "object") continue;
+    const profileId = typeof session.profileId === "string" && session.profileId.trim()
+      ? session.profileId
+      : "local";
+    const rawSessionId = session.rawSessionId || session.id;
+    if (
+      profileId === identity.profileId
+      && rawSessionId === identity.rawSessionId
+      && session.agentId === "pi"
+      && session.headless !== true
+      && session.startupRecovered !== true
+      && session.hiddenFromHud !== true
+      && !isInactiveState(session.state)
+    ) {
+      return session;
+    }
+  }
   return null;
 }
 
@@ -312,7 +373,9 @@ function buildSanitizedTeamProjection({
   options = {},
 }) {
   const callerMember = Array.isArray(team.members) ? team.members.find((m) => m && m.petId === caller.petId) : null;
-  const callerRole = (callerMember && typeof callerMember.role === "string") ? callerMember.role : "member";
+  const callerRole = (callerMember && typeof callerMember.role === "string")
+    ? callerMember.role
+    : ((team.leaderPetId === caller.petId) ? "leader" : "member");
   const callerGeneration = registry && typeof registry.getGeneration === "function"
     ? registry.getGeneration({ profileId: caller.profileId || "local", agentId: "pi", rawSessionId: caller.rawSessionId })
     : null;
@@ -363,6 +426,17 @@ function buildSanitizedTeamProjection({
         canMessage: false,
       });
     } else {
+      let memberRef;
+      if (callerRole === "leader" && handleStore && typeof handleStore.createMemberHandle === "function") {
+        memberRef = handleStore.createMemberHandle({
+          callerPetId: caller.petId,
+          teamId: team.teamId,
+          revision: team.revision,
+          memberPetId: member.petId,
+          joinedAtMs: member.joinedAtMs,
+        });
+      }
+
       const activeEntry = activeSessionByPetId.get(member.petId);
       if (activeEntry && handleStore && typeof handleStore.createCatalogHandle === "function" && callerGeneration !== null) {
         const { session, profileId, rawSessionId } = activeEntry;
@@ -381,16 +455,24 @@ function buildSanitizedTeamProjection({
           nowMs: typeof options.now === "function" ? options.now() : undefined,
         });
 
-        sanitizedMembers.push({ displayName, host, state, role: member.role, canMessage: true, handle });
+        const memberObj = { displayName, host, state, role: member.role, canMessage: true, handle };
+        if (callerRole === "leader" && typeof memberRef === "string") {
+          memberObj.memberRef = memberRef;
+        }
+        sanitizedMembers.push(memberObj);
       } else {
         const offlineSession = sessionByPetId.get(member.petId);
-        sanitizedMembers.push({
+        const memberObj = {
           displayName: sanitizeDisplayName((offlineSession && (offlineSession.displayTitle || offlineSession.sessionTitle || offlineSession.agentName)) || "Pi"),
           host: sanitizeHost((offlineSession && (offlineSession.sourceDisplayLabel || offlineSession.host)) || "unknown"),
           state: sanitizeState((offlineSession && offlineSession.state) || "offline"),
           role: member.role,
           canMessage: false,
-        });
+        };
+        if (callerRole === "leader" && typeof memberRef === "string") {
+          memberObj.memberRef = memberRef;
+        }
+        sanitizedMembers.push(memberObj);
       }
     }
   }
@@ -659,6 +741,324 @@ function handlePetTeamCreatePost(req, res, options = {}) {
   });
 }
 
+function handlePetTeamAddPost(req, res, options = {}) {
+  readJsonBody(req, res, validatePetTeamAddPayload, (data) => {
+    const auth = authenticateTeamRequest(req, res, options, data);
+    if (!auth) return;
+
+    const { callerProfileId, registry, teamStore, derivePetId, callerPetId } = auth;
+
+    // 1. Caller active team check
+    const teams = teamStore.listTeamsForPet({ petId: callerPetId });
+    const activeTeams = Array.isArray(teams) ? teams.filter((t) => t && t.status === "active") : [];
+
+    if (activeTeams.length === 0) {
+      sendJsonResponse(res, 404, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Caller does not belong to any active team",
+      });
+      return;
+    }
+
+    const activeTeam = activeTeams[0];
+
+    // 2. Leader only check
+    if (activeTeam.leaderPetId !== callerPetId) {
+      sendJsonResponse(res, 403, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Only the team leader can add members",
+      });
+      return;
+    }
+
+    // 3. Check team max members (max 8)
+    if (Array.isArray(activeTeam.members) && activeTeam.members.length >= 8) {
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Team has reached the maximum of 8 members",
+      });
+      return;
+    }
+
+    // 4. Resolve and consume the target handle
+    const handleStore = options.peerHandleStore || (options.ctx && options.ctx.peerHandleStore);
+    if (!handleStore || typeof handleStore.resolveAndConsumeHandle !== "function") {
+      sendJsonResponse(res, 503, { status: "failed", reason: "peer handle store unavailable" });
+      return;
+    }
+
+    const callerRef = {
+      profileId: callerProfileId,
+      agentId: "pi",
+      rawSessionId: data.rawSessionId,
+    };
+
+    const handleResult = handleStore.resolveAndConsumeHandle(data.target, {
+      caller: callerRef,
+      registry,
+      expectedType: "catalog",
+    });
+
+    if (!handleResult.ok) {
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: handleResult.reason === "purpose_mismatch"
+          ? "Target handle must be a catalog handle"
+          : `Target handle invalid or expired: ${handleResult.reason}`,
+      });
+      return;
+    }
+
+    const { entry } = handleResult;
+    const targetProfileId = (entry && entry.target && entry.target.profileId) || "local";
+    const targetRawSessionId = entry && entry.target && entry.target.rawSessionId;
+
+    const targetPetId = derivePetId({
+      profileId: targetProfileId,
+      agentId: "pi",
+      rawSessionId: targetRawSessionId,
+    });
+
+    const candidateSessions = getCandidateSessions(options);
+    if (!Array.isArray(candidateSessions)) {
+      sendJsonResponse(res, 500, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "failed",
+        reason: "Failed to retrieve session snapshot",
+      });
+      return;
+    }
+    if (!findEligibleCandidateSession(candidateSessions, {
+      profileId: targetProfileId,
+      rawSessionId: targetRawSessionId,
+    })) {
+      sendJsonResponse(res, 422, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Target session is inactive, closed, or not found",
+      });
+      return;
+    }
+
+    // 5. Reject self
+    if (targetPetId === callerPetId) {
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Caller cannot add self as team member",
+      });
+      return;
+    }
+
+    // 6. Reject already-member
+    if (Array.isArray(activeTeam.members) && activeTeam.members.some((m) => m && m.petId === targetPetId)) {
+      sendJsonResponse(res, 409, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Target member is already in the team",
+      });
+      return;
+    }
+
+    // 7. Reject target in another active team
+    const targetTeams = teamStore.listTeamsForPet({ petId: targetPetId });
+    if (Array.isArray(targetTeams) && targetTeams.some((t) => t && t.status === "active")) {
+      sendJsonResponse(res, 409, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: "Target member already belongs to an active team",
+      });
+      return;
+    }
+
+    // 8. Invoke teamStore.addMember
+    const addResult = teamStore.addMember({
+      teamId: activeTeam.teamId,
+      petId: targetPetId,
+      role: "member",
+      baseRevision: activeTeam.revision,
+      actor: { kind: "user" },
+    });
+
+    if (!addResult || !addResult.ok) {
+      if (addResult && addResult.error === "conflict") {
+        sendJsonResponse(res, 409, {
+          schemaVersion: "1",
+          kind: "team_add",
+          status: "conflict",
+          reason: addResult.reason || "Revision mismatch",
+          currentRevision: typeof addResult.currentRevision === "number" ? addResult.currentRevision : undefined,
+        });
+        return;
+      }
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_add",
+        status: "rejected",
+        reason: (addResult && (addResult.reason || addResult.error)) || "Failed to add member",
+      });
+      return;
+    }
+
+    const projectedTeam = buildSanitizedTeamProjection({
+      team: addResult.team,
+      caller: {
+        profileId: callerProfileId,
+        rawSessionId: data.rawSessionId,
+        petId: callerPetId,
+      },
+      candidateSessions: candidateSessions || [],
+      handleStore,
+      registry,
+      derivePetId,
+      options,
+    });
+
+    notifyTeamPresentationChanged(options);
+    sendJsonResponse(res, 200, {
+      schemaVersion: "1",
+      kind: "team_add",
+      status: "active",
+      team: projectedTeam,
+    });
+  });
+}
+
+function handlePetTeamRemovePost(req, res, options = {}) {
+  readJsonBody(req, res, validatePetTeamRemovePayload, (data) => {
+    const auth = authenticateTeamRequest(req, res, options, data);
+    if (!auth) return;
+
+    const { callerProfileId, registry, teamStore, derivePetId, callerPetId } = auth;
+
+    // 1. Caller active team check
+    const teams = teamStore.listTeamsForPet({ petId: callerPetId });
+    const activeTeams = Array.isArray(teams) ? teams.filter((t) => t && t.status === "active") : [];
+
+    if (activeTeams.length === 0) {
+      sendJsonResponse(res, 404, {
+        schemaVersion: "1",
+        kind: "team_remove",
+        status: "rejected",
+        reason: "Caller does not belong to any active team",
+      });
+      return;
+    }
+
+    const activeTeam = activeTeams[0];
+
+    // 2. Leader only check
+    if (activeTeam.leaderPetId !== callerPetId) {
+      sendJsonResponse(res, 403, {
+        schemaVersion: "1",
+        kind: "team_remove",
+        status: "rejected",
+        reason: "Only the team leader can remove members",
+      });
+      return;
+    }
+
+    // 3. Resolve member handle by iterating current members against HMAC without target registry
+    const handleStore = options.peerHandleStore || (options.ctx && options.ctx.peerHandleStore);
+    if (!handleStore || typeof handleStore.resolveMemberHandle !== "function") {
+      sendJsonResponse(res, 503, { status: "failed", reason: "peer handle store unavailable" });
+      return;
+    }
+
+    const resolveResult = handleStore.resolveMemberHandle(data.member, {
+      callerPetId,
+      team: activeTeam,
+    });
+
+    if (!resolveResult || !resolveResult.ok || !resolveResult.member) {
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_remove",
+        status: "rejected",
+        reason: "Invalid or expired member handle",
+      });
+      return;
+    }
+
+    const targetMember = resolveResult.member;
+
+    // 4. Protect leader (cannot remove leader)
+    if (targetMember.petId === activeTeam.leaderPetId) {
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_remove",
+        status: "rejected",
+        reason: "Leader cannot be removed from the team",
+      });
+      return;
+    }
+
+    // 5. Invoke teamStore.removeMember
+    const removeResult = teamStore.removeMember({
+      teamId: activeTeam.teamId,
+      petId: targetMember.petId,
+      baseRevision: activeTeam.revision,
+      actor: { kind: "user" },
+    });
+
+    if (!removeResult || !removeResult.ok) {
+      if (removeResult && removeResult.error === "conflict") {
+        sendJsonResponse(res, 409, {
+          schemaVersion: "1",
+          kind: "team_remove",
+          status: "conflict",
+          reason: removeResult.reason || "Revision mismatch",
+          currentRevision: typeof removeResult.currentRevision === "number" ? removeResult.currentRevision : undefined,
+        });
+        return;
+      }
+      sendJsonResponse(res, 400, {
+        schemaVersion: "1",
+        kind: "team_remove",
+        status: "rejected",
+        reason: (removeResult && (removeResult.reason || removeResult.error)) || "Failed to remove member",
+      });
+      return;
+    }
+
+    const candidateSessions = getCandidateSessions(options);
+    const projectedTeam = buildSanitizedTeamProjection({
+      team: removeResult.team,
+      caller: {
+        profileId: callerProfileId,
+        rawSessionId: data.rawSessionId,
+        petId: callerPetId,
+      },
+      candidateSessions: candidateSessions || [],
+      handleStore,
+      registry,
+      derivePetId,
+      options,
+    });
+
+    notifyTeamPresentationChanged(options);
+    sendJsonResponse(res, 200, {
+      schemaVersion: "1",
+      kind: "team_remove",
+      status: "active",
+      team: projectedTeam,
+    });
+  });
+}
+
 function handlePetTeamDissolvePost(req, res, options = {}) {
   readJsonBody(req, res, validatePetTeamDissolvePayload, (data) => {
     const auth = authenticateTeamRequest(req, res, options, data);
@@ -906,11 +1306,15 @@ module.exports = {
   MAX_BOARD_MARKDOWN_BYTES,
   ALLOWED_TEAM_STATUS_KEYS,
   ALLOWED_TEAM_CREATE_KEYS,
+  ALLOWED_TEAM_ADD_KEYS,
+  ALLOWED_TEAM_REMOVE_KEYS,
   ALLOWED_TEAM_DISSOLVE_KEYS,
   ALLOWED_TEAM_BOARD_READ_KEYS,
   ALLOWED_TEAM_BOARD_WRITE_KEYS,
   validatePetTeamStatusPayload,
   validatePetTeamCreatePayload,
+  validatePetTeamAddPayload,
+  validatePetTeamRemovePayload,
   validatePetTeamDissolvePayload,
   validatePetTeamBoardReadPayload,
   validatePetTeamBoardWritePayload,
@@ -919,6 +1323,8 @@ module.exports = {
   buildSanitizedBoardProjection,
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
+  handlePetTeamAddPost,
+  handlePetTeamRemovePost,
   handlePetTeamDissolvePost,
   handlePetTeamBoardReadPost,
   handlePetTeamBoardWritePost,

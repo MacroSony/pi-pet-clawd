@@ -81,6 +81,8 @@ function createIngressRequestHandler(options = {}, counters = { acceptedCount: 0
     const isPetTeamEndpoint = req.method === "POST" && (
       req.url === "/pet-team/status"
       || req.url === "/pet-team/create"
+      || req.url === "/pet-team/add"
+      || req.url === "/pet-team/remove"
       || req.url === "/pet-team/dissolve"
       || req.url === "/pet-team/board/read"
       || req.url === "/pet-team/board/write"

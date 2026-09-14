@@ -70,6 +70,8 @@ const {
 const {
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
+  handlePetTeamAddPost,
+  handlePetTeamRemovePost,
   handlePetTeamDissolvePost,
   handlePetTeamBoardReadPost,
   handlePetTeamBoardWritePost,
@@ -879,6 +881,26 @@ function routeHttpRequest(req, res, remoteProfile = null) {
       });
     } else if (req.method === "POST" && req.url === "/pet-team/create") {
       handlePetTeamCreatePost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/add") {
+      handlePetTeamAddPost(req, res, {
+        ctx,
+        remoteProfile,
+        peerCapabilityRegistry: petPeerCapabilityRegistry,
+        peerHandleStore: petPeerHandleStore,
+        getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined,
+        teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined,
+        derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
+      });
+    } else if (req.method === "POST" && req.url === "/pet-team/remove") {
+      handlePetTeamRemovePost(req, res, {
         ctx,
         remoteProfile,
         peerCapabilityRegistry: petPeerCapabilityRegistry,

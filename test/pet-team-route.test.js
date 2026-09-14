@@ -20,15 +20,20 @@ const {
 const {
   handlePetTeamStatusPost,
   handlePetTeamCreatePost,
+  handlePetTeamAddPost,
+  handlePetTeamRemovePost,
   handlePetTeamDissolvePost,
   handlePetTeamBoardReadPost,
   handlePetTeamBoardWritePost,
   validatePetTeamStatusPayload,
   validatePetTeamCreatePayload,
+  validatePetTeamAddPayload,
+  validatePetTeamRemovePayload,
   validatePetTeamDissolvePayload,
   validatePetTeamBoardReadPayload,
   validatePetTeamBoardWritePayload,
   resolveTeamBoardStore,
+  buildSanitizedTeamProjection,
   buildSanitizedBoardProjection,
 } = require("../src/server-route-pet-team");
 const initServer = require("../src/server");
@@ -130,6 +135,66 @@ describe("Pet Team Route Payload Validations", () => {
     assert.equal(validatePetTeamCreatePayload({ ...valid, targets: ["psh_same", "psh_same"] }).ok, false);
   });
 
+  test("add payload validation enforces strict keys and valid target psh_ handle", () => {
+    const valid = {
+      schemaVersion: "1",
+      kind: "team_add",
+      rawSessionId: "session-1",
+      capabilityToken: generateToken(),
+      target: "psh_validTargetHandle123",
+    };
+    assert.equal(validatePetTeamAddPayload(valid).ok, true);
+
+    // Unknown property
+    assert.equal(validatePetTeamAddPayload({ ...valid, extra: "foo" }).ok, false);
+    // Invalid schemaVersion
+    assert.equal(validatePetTeamAddPayload({ ...valid, schemaVersion: "2" }).ok, false);
+    // Invalid kind
+    assert.equal(validatePetTeamAddPayload({ ...valid, kind: "team_create" }).ok, false);
+    // Invalid rawSessionId
+    assert.equal(validatePetTeamAddPayload({ ...valid, rawSessionId: "default" }).ok, false);
+    assert.equal(validatePetTeamAddPayload({ ...valid, rawSessionId: "pi:default" }).ok, false);
+    assert.equal(validatePetTeamAddPayload({ ...valid, rawSessionId: "" }).ok, false);
+    // Invalid capability token
+    assert.equal(validatePetTeamAddPayload({ ...valid, capabilityToken: "bad" }).ok, false);
+    // Missing target
+    assert.equal(validatePetTeamAddPayload({ ...valid, target: undefined }).ok, false);
+    // Invalid target handle format
+    assert.equal(validatePetTeamAddPayload({ ...valid, target: "pmh_abc" }).ok, false);
+    assert.equal(validatePetTeamAddPayload({ ...valid, target: "invalid_handle" }).ok, false);
+    assert.equal(validatePetTeamAddPayload({ ...valid, target: 12345 }).ok, false);
+  });
+
+  test("remove payload validation enforces strict keys and valid member pmh_ handle", () => {
+    const valid = {
+      schemaVersion: "1",
+      kind: "team_remove",
+      rawSessionId: "session-1",
+      capabilityToken: generateToken(),
+      member: "pmh_validMemberHandle123",
+    };
+    assert.equal(validatePetTeamRemovePayload(valid).ok, true);
+
+    // Unknown property
+    assert.equal(validatePetTeamRemovePayload({ ...valid, extra: "foo" }).ok, false);
+    // Invalid schemaVersion
+    assert.equal(validatePetTeamRemovePayload({ ...valid, schemaVersion: "2" }).ok, false);
+    // Invalid kind
+    assert.equal(validatePetTeamRemovePayload({ ...valid, kind: "team_add" }).ok, false);
+    // Invalid rawSessionId
+    assert.equal(validatePetTeamRemovePayload({ ...valid, rawSessionId: "default" }).ok, false);
+    assert.equal(validatePetTeamRemovePayload({ ...valid, rawSessionId: "pi:default" }).ok, false);
+    assert.equal(validatePetTeamRemovePayload({ ...valid, rawSessionId: "" }).ok, false);
+    // Invalid capability token
+    assert.equal(validatePetTeamRemovePayload({ ...valid, capabilityToken: "bad" }).ok, false);
+    // Missing member
+    assert.equal(validatePetTeamRemovePayload({ ...valid, member: undefined }).ok, false);
+    // Invalid member handle format
+    assert.equal(validatePetTeamRemovePayload({ ...valid, member: "psh_abc" }).ok, false);
+    assert.equal(validatePetTeamRemovePayload({ ...valid, member: "invalid_handle" }).ok, false);
+    assert.equal(validatePetTeamRemovePayload({ ...valid, member: 12345 }).ok, false);
+  });
+
   test("dissolve payload validation enforces strict keys and schemaVersion", () => {
     const valid = {
       schemaVersion: "1",
@@ -209,6 +274,152 @@ describe("Pet Team Route Payload Validations", () => {
   });
 });
 
+describe("Member Handle Store HMAC Security & Determinism", () => {
+  const secretA = Buffer.from("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "hex");
+  const secretB = Buffer.from("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "hex");
+
+  test("deterministic HMAC formula produces identical pmh_ handles given identical inputs and secret seam", () => {
+    const store1 = createPetPeerHandleStore({ memberSecret: secretA });
+    const store2 = createPetPeerHandleStore({ memberSecret: secretA });
+
+    const params = {
+      callerPetId: "pet_aaaaaaaaaaaaaaaaaaaaaaaa",
+      teamId: "team_alpha_456",
+      revision: 3,
+      memberPetId: "pet_cccccccccccccccccccccccc",
+      joinedAtMs: 1700000000000,
+    };
+
+    const handle1 = store1.createMemberHandle(params);
+    const handle2 = store2.createMemberHandle(params);
+
+    assert.ok(typeof handle1 === "string");
+    assert.ok(handle1.startsWith("pmh_"));
+    assert.match(handle1, /^pmh_[A-Za-z0-9_-]{43}$/);
+    assert.equal(handle1, handle2);
+
+    // Verify matchesMemberHandle
+    assert.equal(store1.matchesMemberHandle(handle1, params), true);
+    assert.equal(store2.matchesMemberHandle(handle2, params), true);
+  });
+
+  test("process secret seam isolation: different secrets yield completely distinct HMAC handles", () => {
+    const storeA = createPetPeerHandleStore({ memberSecret: secretA });
+    const storeB = createPetPeerHandleStore({ memberSecret: secretB });
+
+    const params = {
+      callerPetId: "pet_aaaaaaaaaaaaaaaaaaaaaaaa",
+      teamId: "team_alpha_456",
+      revision: 1,
+      memberPetId: "pet_cccccccccccccccccccccccc",
+      joinedAtMs: 1700000000000,
+    };
+
+    const handleA = storeA.createMemberHandle(params);
+    const handleB = storeB.createMemberHandle(params);
+
+    assert.notEqual(handleA, handleB);
+    assert.equal(storeA.matchesMemberHandle(handleA, params), true);
+    assert.equal(storeA.matchesMemberHandle(handleB, params), false);
+    assert.equal(storeB.matchesMemberHandle(handleA, params), false);
+    assert.equal(storeB.matchesMemberHandle(handleB, params), true);
+  });
+
+  test("5-tuple scope binding: changing any single parameter invalidates HMAC", () => {
+    const store = createPetPeerHandleStore({ memberSecret: secretA });
+
+    const base = {
+      callerPetId: "pet_aaaaaaaaaaaaaaaaaaaaaaaa",
+      teamId: "team_alpha_456",
+      revision: 1,
+      memberPetId: "pet_cccccccccccccccccccccccc",
+      joinedAtMs: 1700000000000,
+    };
+
+    const handle = store.createMemberHandle(base);
+
+    // 1. Different callerPetId
+    assert.equal(store.matchesMemberHandle(handle, { ...base, callerPetId: "pet_bbbbbbbbbbbbbbbbbbbbbbbb" }), false);
+    // 2. Different teamId
+    assert.equal(store.matchesMemberHandle(handle, { ...base, teamId: "team_beta_789" }), false);
+    // 3. Different revision
+    assert.equal(store.matchesMemberHandle(handle, { ...base, revision: 2 }), false);
+    // 4. Different memberPetId
+    assert.equal(store.matchesMemberHandle(handle, { ...base, memberPetId: "pet_dddddddddddddddddddddddd" }), false);
+    // 5. Different joinedAtMs
+    assert.equal(store.matchesMemberHandle(handle, { ...base, joinedAtMs: 1700000000001 }), false);
+  });
+
+  test("format validation and timing-safe member resolution", () => {
+    const store = createPetPeerHandleStore({ memberSecret: secretA });
+
+    const callerPetId = "pet_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const team = {
+      teamId: "team_alpha_456",
+      revision: 2,
+      members: [
+        { petId: "pet_eeeeeeeeeeeeeeeeeeeeeeee", role: "leader", joinedAtMs: 1000 },
+        { petId: "pet_cccccccccccccccccccccccc", role: "member", joinedAtMs: 2000 },
+        { petId: "pet_dddddddddddddddddddddddd", role: "member", joinedAtMs: 3000 },
+      ],
+    };
+
+    const handleWorker1 = store.createMemberHandle({
+      callerPetId,
+      teamId: team.teamId,
+      revision: team.revision,
+      memberPetId: "pet_cccccccccccccccccccccccc",
+      joinedAtMs: 2000,
+    });
+
+    // Valid resolve
+    const res1 = store.resolveMemberHandle(handleWorker1, { callerPetId, team });
+    assert.equal(res1.ok, true);
+    assert.equal(res1.member.petId, "pet_cccccccccccccccccccccccc");
+
+    // Invalid format
+    assert.equal(store.resolveMemberHandle("psh_catalog_handle", { callerPetId, team }).ok, false);
+    assert.equal(store.resolveMemberHandle("pmh_invalid!", { callerPetId, team }).ok, false);
+    assert.equal(store.resolveMemberHandle("", { callerPetId, team }).ok, false);
+    assert.equal(store.resolveMemberHandle(null, { callerPetId, team }).ok, false);
+
+    // Stale revision resolve
+    const staleTeam = { ...team, revision: 3 };
+    const resStale = store.resolveMemberHandle(handleWorker1, { callerPetId, team: staleTeam });
+    assert.equal(resStale.ok, false);
+    assert.equal(resStale.reason, "not_found");
+
+    // Different caller resolve
+    const resWrongCaller = store.resolveMemberHandle(handleWorker1, { callerPetId: "pet_bbbbbbbbbbbbbbbbbbbbbbbb", team });
+    assert.equal(resWrongCaller.ok, false);
+    assert.equal(resWrongCaller.reason, "not_found");
+  });
+
+  test("invalid parameters to createMemberHandle return null", () => {
+    const store = createPetPeerHandleStore();
+    const valid = {
+      callerPetId: "pet_aaaaaaaaaaaaaaaaaaaaaaaa",
+      teamId: "team_1",
+      revision: 1,
+      memberPetId: "pet_cccccccccccccccccccccccc",
+      joinedAtMs: 1000,
+    };
+
+    assert.equal(store.createMemberHandle({ ...valid, callerPetId: "" }), null);
+    assert.equal(store.createMemberHandle({ ...valid, callerPetId: null }), null);
+    assert.equal(store.createMemberHandle({ ...valid, teamId: "" }), null);
+    assert.equal(store.createMemberHandle({ ...valid, revision: -1 }), null);
+    assert.equal(store.createMemberHandle({ ...valid, revision: 1.5 }), null);
+    assert.equal(store.createMemberHandle({ ...valid, revision: "1" }), null);
+    assert.equal(store.createMemberHandle({ ...valid, memberPetId: "" }), null);
+    assert.equal(store.createMemberHandle({ ...valid, joinedAtMs: -1 }), null);
+    assert.equal(store.createMemberHandle({ ...valid, joinedAtMs: NaN }), null);
+    assert.equal(store.createMemberHandle(), null);
+    assert.throws(() => createPetPeerHandleStore({ memberSecret: "not-a-buffer" }), /memberSecret/);
+    assert.throws(() => createPetPeerHandleStore({ memberSecret: Buffer.alloc(31) }), /memberSecret/);
+  });
+});
+
 describe("Pet Team Route Execution & Lifecycle", () => {
   let tmpDataDir;
   let teamStore;
@@ -271,6 +482,32 @@ describe("Pet Team Route Execution & Lifecycle", () => {
         state: "sleeping", // inactive
       },
     ];
+  }
+
+  async function callTeamRoute(handler, url, body, overrides = {}) {
+    const { res, result } = createMockRes();
+    const req = createMockReq({ url, body: JSON.stringify(body) });
+    handler(req, res, {
+      peerCapabilityRegistry: registry,
+      peerHandleStore: handleStore,
+      teamStore,
+      derivePetId,
+      sessions: getSessions(),
+      ...overrides,
+    });
+    await result.done;
+    return { statusCode: result.statusCode, body: JSON.parse(result.body), rawBody: result.body };
+  }
+
+  function createCatalogHandleFor(callerRawSessionId, targetRawSessionId) {
+    const callerGeneration = registry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: callerRawSessionId });
+    const targetGeneration = registry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: targetRawSessionId });
+    return handleStore.createCatalogHandle({
+      caller: { profileId: "local", agentId: "pi", rawSessionId: callerRawSessionId },
+      callerGeneration,
+      target: { profileId: "local", agentId: "pi", rawSessionId: targetRawSessionId, displayName: "Target Pi", host: "local" },
+      targetGeneration,
+    }).handle;
   }
 
   test("status returns none when caller has no active team", async () => {
@@ -394,6 +631,245 @@ describe("Pet Team Route Execution & Lifecycle", () => {
     assert.equal(rawJson.includes('"petId"'), false);
     assert.equal(rawJson.includes('"rawSessionId"'), false);
     assert.equal(rawJson.includes('"capabilityToken"'), false);
+  });
+
+  test("leader status exposes caller-scoped member refs for online and offline teammates only", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+    const target2PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target2Raw });
+    teamStore.createTeam({
+      name: "Reference Team",
+      leaderPetId: callerPetId,
+      members: [
+        { petId: target1PetId, role: "member" },
+        { petId: target2PetId, role: "observer" },
+      ],
+      actor: { kind: "user" },
+    });
+
+    const leaderStatus = await callTeamRoute(handlePetTeamStatusPost, "/pet-team/status", {
+      schemaVersion: "1",
+      kind: "team_status",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+    });
+    assert.equal(leaderStatus.statusCode, 200);
+    const [self, onlineMember, offlineMember] = leaderStatus.body.team.members;
+    assert.equal(self.memberRef, undefined);
+    assert.match(onlineMember.memberRef, /^pmh_[A-Za-z0-9_-]+$/);
+    assert.match(offlineMember.memberRef, /^pmh_[A-Za-z0-9_-]+$/);
+    assert.equal(onlineMember.canMessage, true);
+    assert.equal(offlineMember.canMessage, false);
+    assert.equal(offlineMember.handle, undefined);
+
+    const memberStatus = await callTeamRoute(handlePetTeamStatusPost, "/pet-team/status", {
+      schemaVersion: "1",
+      kind: "team_status",
+      rawSessionId: target1Raw,
+      capabilityToken: target1Token,
+    });
+    assert.equal(memberStatus.statusCode, 200);
+    assert.equal(memberStatus.body.team.callerRole, "member");
+    assert.equal(memberStatus.body.team.members.some((member) => member.memberRef !== undefined), false);
+
+    for (const secret of [callerPetId, target1PetId, target2PetId, callerRaw, target1Raw, target2Raw]) {
+      assert.equal(leaderStatus.rawBody.includes(secret), false);
+      assert.equal(memberStatus.rawBody.includes(secret), false);
+    }
+  });
+
+  test("leader adds an online catalog target and receives an updated removable member projection", async () => {
+    let presentationRefreshes = 0;
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+    teamStore.createTeam({
+      name: "Growing Team",
+      leaderPetId: callerPetId,
+      members: [],
+      actor: { kind: "user" },
+    });
+    const targetHandle = createCatalogHandleFor(callerRaw, target1Raw);
+
+    const added = await callTeamRoute(handlePetTeamAddPost, "/pet-team/add", {
+      schemaVersion: "1",
+      kind: "team_add",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      target: targetHandle,
+    }, {
+      onTeamPresentationChanged: () => { presentationRefreshes += 1; },
+    });
+
+    assert.equal(added.statusCode, 200);
+    assert.equal(added.body.kind, "team_add");
+    assert.equal(added.body.status, "active");
+    assert.equal(added.body.team.revision, 2);
+    assert.equal(added.body.team.members.length, 2);
+    assert.equal(presentationRefreshes, 1);
+    const target = added.body.team.members.find((member) => member.role === "member");
+    assert.ok(target);
+    assert.match(target.handle, /^psh_/);
+    assert.match(target.memberRef, /^pmh_/);
+    assert.equal(teamStore.listTeamsForPet({ petId: target1PetId }).filter((team) => team.status === "active").length, 1);
+    assert.equal(handleStore.resolveAndConsumeHandle(targetHandle, {
+      caller: { profileId: "local", agentId: "pi", rawSessionId: callerRaw },
+      registry,
+      expectedType: "catalog",
+    }).reason, "not_found");
+    for (const secret of [callerPetId, target1PetId, callerRaw, target1Raw, callerToken, target1Token]) {
+      assert.equal(added.rawBody.includes(secret), false);
+    }
+  });
+
+  test("add fails closed when the target is inactive or the session snapshot is unavailable", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    teamStore.createTeam({
+      name: "Online Only Team",
+      leaderPetId: callerPetId,
+      members: [],
+      actor: { kind: "user" },
+    });
+
+    const sleepingHandle = createCatalogHandleFor(callerRaw, target2Raw);
+    const inactive = await callTeamRoute(handlePetTeamAddPost, "/pet-team/add", {
+      schemaVersion: "1",
+      kind: "team_add",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      target: sleepingHandle,
+    });
+    assert.equal(inactive.statusCode, 422);
+    assert.match(inactive.body.reason, /inactive/);
+
+    const activeHandle = createCatalogHandleFor(callerRaw, target1Raw);
+    const unavailable = await callTeamRoute(handlePetTeamAddPost, "/pet-team/add", {
+      schemaVersion: "1",
+      kind: "team_add",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      target: activeHandle,
+    }, { sessions: null });
+    assert.equal(unavailable.statusCode, 500);
+    assert.match(unavailable.body.reason, /snapshot/);
+    assert.equal(teamStore.getTeam({ teamId: teamStore.listTeamsForPet({ petId: callerPetId })[0].teamId }).members.length, 1);
+  });
+
+  test("non-leader cannot add or remove and authorization failure does not consume the add handle", async () => {
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+    teamStore.createTeam({
+      name: "Leader Guard Team",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    });
+    const target2Handle = createCatalogHandleFor(target1Raw, target2Raw);
+
+    const addDenied = await callTeamRoute(handlePetTeamAddPost, "/pet-team/add", {
+      schemaVersion: "1",
+      kind: "team_add",
+      rawSessionId: target1Raw,
+      capabilityToken: target1Token,
+      target: target2Handle,
+    });
+    assert.equal(addDenied.statusCode, 403);
+    assert.match(addDenied.body.reason, /leader/);
+    assert.equal(handleStore.resolveAndConsumeHandle(target2Handle, {
+      caller: { profileId: "local", agentId: "pi", rawSessionId: target1Raw },
+      registry,
+      expectedType: "catalog",
+    }).ok, true);
+
+    const leaderStatus = await callTeamRoute(handlePetTeamStatusPost, "/pet-team/status", {
+      schemaVersion: "1",
+      kind: "team_status",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+    });
+    const memberRef = leaderStatus.body.team.members.find((member) => member.role === "member").memberRef;
+    const removeDenied = await callTeamRoute(handlePetTeamRemovePost, "/pet-team/remove", {
+      schemaVersion: "1",
+      kind: "team_remove",
+      rawSessionId: target1Raw,
+      capabilityToken: target1Token,
+      member: memberRef,
+    });
+    assert.equal(removeDenied.statusCode, 403);
+    assert.match(removeDenied.body.reason, /leader/);
+  });
+
+  test("leader removes an offline member with pmh_ and stale or leader refs fail closed", async () => {
+    let presentationRefreshes = 0;
+    const callerPetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: callerRaw });
+    const target1PetId = derivePetId({ profileId: "local", agentId: "pi", rawSessionId: target1Raw });
+    const created = teamStore.createTeam({
+      name: "Offline Removal Team",
+      leaderPetId: callerPetId,
+      members: [{ petId: target1PetId, role: "member" }],
+      actor: { kind: "user" },
+    }).team;
+    assert.equal(registry.revokeCapability({
+      profileId: "local",
+      agentId: "pi",
+      rawSessionId: target1Raw,
+      token: target1Token,
+    }), true);
+
+    const status = await callTeamRoute(handlePetTeamStatusPost, "/pet-team/status", {
+      schemaVersion: "1",
+      kind: "team_status",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+    }, { sessions: getSessions().filter((session) => session.rawSessionId === callerRaw) });
+    const offlineMember = status.body.team.members.find((member) => member.role === "member");
+    assert.equal(offlineMember.state, "offline");
+    assert.equal(offlineMember.canMessage, false);
+    assert.equal(offlineMember.handle, undefined);
+    assert.match(offlineMember.memberRef, /^pmh_/);
+
+    const leaderMember = created.members.find((member) => member.petId === callerPetId);
+    const leaderRef = handleStore.createMemberHandle({
+      callerPetId,
+      teamId: created.teamId,
+      revision: created.revision,
+      memberPetId: callerPetId,
+      joinedAtMs: leaderMember.joinedAtMs,
+    });
+    const leaderDenied = await callTeamRoute(handlePetTeamRemovePost, "/pet-team/remove", {
+      schemaVersion: "1",
+      kind: "team_remove",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      member: leaderRef,
+    });
+    assert.equal(leaderDenied.statusCode, 400);
+    assert.match(leaderDenied.body.reason, /Leader cannot be removed/);
+
+    const removed = await callTeamRoute(handlePetTeamRemovePost, "/pet-team/remove", {
+      schemaVersion: "1",
+      kind: "team_remove",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      member: offlineMember.memberRef,
+    }, {
+      sessions: getSessions().filter((session) => session.rawSessionId === callerRaw),
+      onTeamPresentationChanged: () => { presentationRefreshes += 1; },
+    });
+    assert.equal(removed.statusCode, 200);
+    assert.equal(removed.body.kind, "team_remove");
+    assert.equal(removed.body.team.revision, 2);
+    assert.equal(removed.body.team.members.length, 1);
+    assert.equal(presentationRefreshes, 1);
+
+    const staleRetry = await callTeamRoute(handlePetTeamRemovePost, "/pet-team/remove", {
+      schemaVersion: "1",
+      kind: "team_remove",
+      rawSessionId: callerRaw,
+      capabilityToken: callerToken,
+      member: offlineMember.memberRef,
+    });
+    assert.equal(staleRetry.statusCode, 400);
+    assert.match(staleRetry.body.reason, /Invalid or expired/);
   });
 
   test("rejects team creation using a reply handle instead of a catalog handle", async () => {
@@ -1558,6 +2034,8 @@ describe("Remote SSH Ingress Routing for Team Endpoints", () => {
     for (const pathName of [
       "/pet-team/status",
       "/pet-team/create",
+      "/pet-team/add",
+      "/pet-team/remove",
       "/pet-team/dissolve",
       "/pet-team/board/read",
       "/pet-team/board/write",
@@ -1593,7 +2071,7 @@ describe("Remote SSH Ingress Routing for Team Endpoints", () => {
   });
 });
 
-describe("Server Routing Dispatch for Board Endpoints", () => {
+describe("Server Routing Dispatch for Team Mutation and Board Endpoints", () => {
   let tmpDir;
   let tStore;
   let pRegistry;
@@ -1615,7 +2093,7 @@ describe("Server Routing Dispatch for Board Endpoints", () => {
     } catch {}
   });
 
-  test("initServer dispatches POST /pet-team/board/read and /pet-team/board/write", async () => {
+  test("initServer dispatches POST /pet-team/add, /remove, /board/read and /board/write", async () => {
     let capturedHandler = null;
     const fakeCreateHttpServer = (handler) => {
       capturedHandler = handler;
@@ -1638,6 +2116,24 @@ describe("Server Routing Dispatch for Board Endpoints", () => {
       teamBoardStore: bStore,
       derivePetId,
       petPeerCapabilityRegistry: pRegistry,
+      getSessionSnapshot: () => ({ sessions: [
+        {
+          profileId: "local",
+          agentId: "pi",
+          rawSessionId: "session-srv",
+          displayTitle: "Server Leader",
+          sourceDisplayLabel: "local",
+          state: "running",
+        },
+        {
+          profileId: "local",
+          agentId: "pi",
+          rawSessionId: "session-srv-target",
+          displayTitle: "Server Target",
+          sourceDisplayLabel: "local",
+          state: "idle",
+        },
+      ] }),
     });
 
     srv.startHttpServer();
@@ -1651,6 +2147,63 @@ describe("Server Routing Dispatch for Board Endpoints", () => {
       members: [],
       actor: { kind: "user" },
     });
+
+    const targetRawSessionId = "session-srv-target";
+    const targetToken = generateToken();
+    pRegistry.registerCapability({
+      profileId: "local",
+      agentId: "pi",
+      rawSessionId: targetRawSessionId,
+      token: targetToken,
+    });
+    const targetHandle = srv.petPeerHandleStore.createCatalogHandle({
+      caller: { profileId: "local", agentId: "pi", rawSessionId: "session-srv" },
+      callerGeneration: pRegistry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: "session-srv" }),
+      target: { profileId: "local", agentId: "pi", rawSessionId: targetRawSessionId, displayName: "Server Target", host: "local" },
+      targetGeneration: pRegistry.getGeneration({ profileId: "local", agentId: "pi", rawSessionId: targetRawSessionId }),
+    }).handle;
+
+    let memberRef;
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/add",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_add",
+          rawSessionId: "session-srv",
+          capabilityToken: cToken,
+          target: targetHandle,
+        }),
+      });
+      capturedHandler(req, res);
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.kind, "team_add");
+      memberRef = body.team.members.find((member) => member.role === "member").memberRef;
+      assert.match(memberRef, /^pmh_/);
+    }
+
+    {
+      const { res, result } = createMockRes();
+      const req = createMockReq({
+        url: "/pet-team/remove",
+        body: JSON.stringify({
+          schemaVersion: "1",
+          kind: "team_remove",
+          rawSessionId: "session-srv",
+          capabilityToken: cToken,
+          member: memberRef,
+        }),
+      });
+      capturedHandler(req, res);
+      await result.done;
+      assert.equal(result.statusCode, 200);
+      const body = JSON.parse(result.body);
+      assert.equal(body.kind, "team_remove");
+      assert.equal(body.team.members.length, 1);
+    }
 
     // Write through initServer captured handler
     {

@@ -373,9 +373,84 @@ function createPetPeerHandleStore(options = {}) {
   const handles = new Map();
   const ttlMs = options.ttlMs || PEER_HANDLE_TTL_MS;
   const nowFn = typeof options.now === "function" ? options.now : () => Date.now();
+  if (options.memberSecret !== undefined && (!Buffer.isBuffer(options.memberSecret) || options.memberSecret.length < 32)) {
+    throw new TypeError("memberSecret must be a Buffer of at least 32 bytes");
+  }
+  const memberSecret = options.memberSecret
+    ? Buffer.from(options.memberSecret)
+    : crypto.randomBytes(32);
 
   function generateHandleId() {
     return `psh_${crypto.randomBytes(24).toString("base64url")}`;
+  }
+
+  function createMemberHandle({ callerPetId, teamId, revision, memberPetId, joinedAtMs } = {}) {
+    if (
+      typeof callerPetId !== "string" || !/^pet_[a-f0-9]{24}$/.test(callerPetId)
+      || typeof teamId !== "string" || !/^team_[A-Za-z0-9_-]{1,60}$/.test(teamId) || teamId.includes("..")
+      || !Number.isSafeInteger(revision) || revision < 1
+      || typeof memberPetId !== "string" || !/^pet_[a-f0-9]{24}$/.test(memberPetId)
+      || !Number.isSafeInteger(joinedAtMs) || joinedAtMs < 0
+    ) {
+      return null;
+    }
+
+    const payload = `${callerPetId}\0${teamId}\0${revision}\0${memberPetId}\0${joinedAtMs}`;
+    const digest = crypto.createHmac("sha256", memberSecret).update(payload).digest("base64url");
+    return `pmh_${digest}`;
+  }
+
+  function matchesMemberHandle(handle, params = {}) {
+    if (typeof handle !== "string" || !/^pmh_[A-Za-z0-9_-]{1,124}$/.test(handle)) {
+      return false;
+    }
+    const expected = createMemberHandle(params);
+    if (!expected) return false;
+    const bufA = Buffer.from(handle, "utf8");
+    const bufB = Buffer.from(expected, "utf8");
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+  }
+
+  function resolveMemberHandle(handle, options = {}) {
+    if (typeof handle !== "string" || !/^pmh_[A-Za-z0-9_-]{1,124}$/.test(handle)) {
+      return { ok: false, reason: "invalid_handle" };
+    }
+
+    const callerPetId = options.callerPetId;
+    const team = options.team;
+    const teamId = (team && team.teamId) || options.teamId;
+    const revision = (team && typeof team.revision === "number") ? team.revision : options.revision;
+    const members = (team && Array.isArray(team.members)) ? team.members : options.members;
+
+    if (!callerPetId || !teamId || typeof revision !== "number" || !Array.isArray(members)) {
+      return { ok: false, reason: "not_found" };
+    }
+
+    const bufHandle = Buffer.from(handle, "utf8");
+    let matchedMember = null;
+
+    for (const member of members) {
+      if (!member || typeof member.petId !== "string" || typeof member.joinedAtMs !== "number") continue;
+      const expected = createMemberHandle({
+        callerPetId,
+        teamId,
+        revision,
+        memberPetId: member.petId,
+        joinedAtMs: member.joinedAtMs,
+      });
+      if (!expected) continue;
+      const bufExpected = Buffer.from(expected, "utf8");
+      if (bufHandle.length === bufExpected.length && crypto.timingSafeEqual(bufHandle, bufExpected)) {
+        matchedMember = member;
+        break;
+      }
+    }
+
+    if (matchedMember) {
+      return { ok: true, member: matchedMember };
+    }
+    return { ok: false, reason: "not_found" };
   }
 
   function createCatalogHandle({ caller, callerGeneration, target, targetGeneration, nowMs }) {
@@ -534,6 +609,9 @@ function createPetPeerHandleStore(options = {}) {
     createCatalogHandle,
     createReplyHandle,
     resolveAndConsumeHandle,
+    createMemberHandle,
+    resolveMemberHandle,
+    matchesMemberHandle,
     pruneExpired,
     clearProfile,
     clear,
