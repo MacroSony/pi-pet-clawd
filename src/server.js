@@ -1,3 +1,5 @@
+const { handlePetActivityAreaPost } = require("./server-route-pet-activity-area");
+const { handlePetGatheringPost } = require("./server-route-pet-gathering");
 // src/server.js — HTTP server + routes (/state, /permission, /health)
 // Extracted from main.js L1337-1528
 
@@ -941,6 +943,10 @@ function routeHttpRequest(req, res, remoteProfile = null) {
         teamBoardStore: typeof ctx.teamBoardStore === "object" ? ctx.teamBoardStore : undefined,
         derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined,
       });
+    } else if (req.method === "POST" && (req.url === "/pet-activity-area/read" || req.url === "/pet-activity-area/write")) {
+      handlePetActivityAreaPost(req, res, { ctx, remoteProfile });
+    } else if (req.method === "POST" && (/^\/pet-gathering\/(report|start|end)$/.test(req.url))) {
+      handlePetGatheringPost(req, res, { ctx, remoteProfile, getSessionSnapshot: typeof ctx.getSessionSnapshot === "function" ? ctx.getSessionSnapshot : undefined, teamStore: typeof ctx.teamStore === "object" ? ctx.teamStore : undefined, derivePetId: typeof ctx.derivePetId === "function" ? ctx.derivePetId : undefined });
     } else if (req.method === "POST" && req.url === "/pet-chat/read") {
       handlePetChatReadPost(req, res, {
         ctx,
