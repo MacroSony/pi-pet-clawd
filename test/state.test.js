@@ -115,6 +115,9 @@ function update(api, o = {}) {
       subagentLifecycleSource: o.subagentLifecycleSource ?? null,
       sessionStartSource: o.sessionStartSource ?? null,
       recapBoundary: o.recapBoundary ?? null,
+      ...(Object.prototype.hasOwnProperty.call(o, "appearanceContext")
+        ? { appearanceContext: o.appearanceContext }
+        : {}),
       recapDedupeId: o.recapDedupeId ?? null,
       recapOccurredAt: o.recapOccurredAt ?? null,
       recapSuppressed: o.recapSuppressed === true,
@@ -6563,5 +6566,150 @@ describe("antigravity trailing PostToolUse filter", () => {
     assert.strictEqual(after.state, "working");
     assert.strictEqual(after.awaitingInputSinceStop, false);
     assert.ok(after.lastToolBoundaryAt > after.lastStopAt, "new turn should refresh tool boundary after Stop");
+  });
+});
+
+describe("Pi Forge appearance context in session state", () => {
+  let api;
+
+  afterEach(() => { if (api) api.cleanup(); });
+
+  const fixture = {
+    schemaVersion: "1",
+    source: "pi-forge",
+    instanceId: "publisher-a",
+    revision: 1,
+    stackKey: "global:work",
+    profileKey: "project:reviewer",
+    projectKey: "a".repeat(64),
+  };
+
+  it("persists an ordinary event's appearance context and preserves it when absent", () => {
+    api = require("../src/state")(makeCtx());
+    update(api, { id: "pi:s1", agentId: "pi", rawSessionId: "s1", appearanceContext: fixture });
+    assert.deepStrictEqual(api.sessions.get("pi:s1").appearanceContext, fixture);
+
+    update(api, { id: "pi:s1", agentId: "pi", rawSessionId: "s1" });
+    assert.deepStrictEqual(api.sessions.get("pi:s1").appearanceContext, fixture, "absent ordinary event preserves");
+
+    update(api, { id: "pi:s1", agentId: "pi", rawSessionId: "s1", appearanceContext: null });
+    assert.strictEqual(api.sessions.get("pi:s1").appearanceContext, null, "explicit null clears");
+  });
+
+  it("enforces revision/retired-instance ordering across ordinary rebuilds and metadata HTTP", () => {
+    api = require("../src/state")(makeCtx());
+    const older = { ...fixture, revision: 1 };
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: older });
+    assert.deepStrictEqual(api.sessions.get("pi:ordered").appearanceContext, older);
+
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: { ...older, revision: 0 } });
+    assert.strictEqual(api.sessions.get("pi:ordered").appearanceContext.revision, 1, "stale same-instance revision ignored");
+
+    const next = { ...fixture, instanceId: "publisher-b", stackKey: "global:next" };
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: next });
+    assert.deepStrictEqual(api.sessions.get("pi:ordered").appearanceContext, next);
+
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: { ...older, revision: 9 } });
+    assert.deepStrictEqual(api.sessions.get("pi:ordered").appearanceContext, next, "retired instance cannot revive");
+
+    assert.strictEqual(api.updateSessionMetadata("pi:ordered", { appearanceContext: null }), true);
+    assert.strictEqual(api.sessions.get("pi:ordered").appearanceContext, null, "explicit clear retires current instance");
+
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: { ...next, revision: 9 } });
+    assert.strictEqual(api.sessions.get("pi:ordered").appearanceContext, null, "ordinary stale context cannot revive after clear");
+
+    const third = { ...fixture, instanceId: "publisher-c", revision: 1 };
+    update(api, { id: "pi:ordered", agentId: "pi", rawSessionId: "ordered", appearanceContext: third });
+    assert.deepStrictEqual(api.sessions.get("pi:ordered").appearanceContext, third, "new instance after clear accepted");
+
+    const entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "pi:ordered");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "appearanceOrder"), false, "private order not in public snapshot");
+  });
+
+  it("distinguishes absent from explicit null through ordinary rebuilds and snapshots", () => {
+    api = require("../src/state")(makeCtx());
+    update(api, { id: "pi:shape", agentId: "pi", rawSessionId: "shape" });
+    let session = api.sessions.get("pi:shape");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(session, "appearanceContext"), false, "plain session has no own context property");
+    let entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "pi:shape");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "appearanceContext"), false, "plain snapshot omits the key");
+
+    update(api, { id: "pi:shape", agentId: "pi", rawSessionId: "shape", appearanceContext: fixture });
+    entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "pi:shape");
+    assert.deepStrictEqual(entry.appearanceContext, fixture);
+
+    update(api, { id: "pi:shape", agentId: "pi", rawSessionId: "shape", appearanceContext: null });
+    session = api.sessions.get("pi:shape");
+    assert.strictEqual(session.appearanceContext, null, "explicit null is retained");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(session, "appearanceContext"), true);
+    entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "pi:shape");
+    assert.strictEqual(entry.appearanceContext, null, "explicit null is projected into the snapshot");
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(entry, "appearanceContext"), true);
+
+    update(api, { id: "pi:shape", agentId: "pi", rawSessionId: "shape" });
+    assert.strictEqual(api.sessions.get("pi:shape").appearanceContext, null, "ordinary absent event preserves explicit null");
+    entry = api.buildSessionSnapshot().sessions.find((s) => s.id === "pi:shape");
+    assert.strictEqual(entry.appearanceContext, null, "ordinary rebuild keeps the clear in the snapshot");
+  });
+
+  it("does not broadcast a duplicate appearance context metadata refresh", () => {
+    let broadcasts = 0;
+    api = require("../src/state")(makeCtx({ broadcastSessionSnapshot: () => { broadcasts += 1; } }));
+    update(api, { id: "pi:dup", agentId: "pi", rawSessionId: "dup", appearanceContext: fixture });
+    const before = broadcasts;
+    assert.strictEqual(api.updateSessionMetadata("pi:dup", { appearanceContext: fixture }), true);
+    assert.strictEqual(broadcasts, before, "duplicate appearance must not produce a status broadcast");
+    assert.deepStrictEqual(api.sessions.get("pi:dup").appearanceContext, fixture);
+  });
+
+  it("fails closed for project-scoped keys without a project key", () => {
+    api = require("../src/state")(makeCtx());
+    update(api, { id: "pi:scope", agentId: "pi", rawSessionId: "scope", appearanceContext: fixture });
+    update(api, {
+      id: "pi:scope",
+      agentId: "pi",
+      rawSessionId: "scope",
+      appearanceContext: { ...fixture, revision: 2, stackKey: "project:app", projectKey: null },
+    });
+    assert.deepStrictEqual(api.sessions.get("pi:scope").appearanceContext, fixture, "malformed project scope preserves prior context");
+  });
+
+  it("metadata-only refresh updates only appearance context and never touches lifecycle", () => {
+    api = require("../src/state")(makeCtx());
+    update(api, { id: "pi:s2", agentId: "pi", rawSessionId: "s2", toolName: "Edit", state: "working" });
+    const before = api.sessions.get("pi:s2");
+    const snapshotBefore = {
+      state: before.state,
+      updatedAt: before.updatedAt,
+      lastToolName: before.lastToolName,
+      recentEvents: JSON.parse(JSON.stringify(before.recentEvents || [])),
+    };
+
+    const changed = api.updateSessionMetadata("pi:s2", {
+      appearanceContext: { ...fixture, revision: 2, stackKey: "project:app" },
+    });
+    assert.strictEqual(changed, true);
+    const after = api.sessions.get("pi:s2");
+    assert.strictEqual(after.appearanceContext.stackKey, "project:app");
+    assert.strictEqual(after.state, snapshotBefore.state);
+    assert.strictEqual(after.updatedAt, snapshotBefore.updatedAt, "metadata refresh must not bump updatedAt");
+    assert.strictEqual(after.lastToolName, snapshotBefore.lastToolName);
+    assert.deepStrictEqual(after.recentEvents, snapshotBefore.recentEvents);
+  });
+
+  it("metadata-only refresh cannot create a session or wake an unknown/offline one", () => {
+    api = require("../src/state")(makeCtx());
+    const accepted = api.updateSessionMetadata("pi:missing", { appearanceContext: fixture });
+    assert.strictEqual(accepted, false);
+    assert.strictEqual(api.sessions.size, 0, "unknown metadata-only session must not be created");
+  });
+
+  it("projects appearance context into the real session snapshot", () => {
+    api = require("../src/state")(makeCtx());
+    update(api, { id: "pi:s3", agentId: "pi", rawSessionId: "s3", appearanceContext: fixture });
+    const snapshot = api.buildSessionSnapshot();
+    const entry = snapshot.sessions.find((s) => s.id === "pi:s3");
+    assert.ok(entry, "session entry must be present");
+    assert.deepStrictEqual(entry.appearanceContext, fixture);
   });
 });

@@ -402,6 +402,14 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     codexOriginator: (session && session.codexOriginator) || null,
     codexSource: (session && session.codexSource) || null,
     contextUsage: snapshotContextUsage(session),
+    // Optional Pi Forge cosmetic context. Closed allowlist object built at the
+    // /state trust boundary; never contains sessionId, paths, prompts or tokens.
+    // Explicit null is a real clear and must be projected as such; an absent
+    // property keeps plain sessions shape-compatible (no key).
+    ...(Object.prototype.hasOwnProperty.call(session || {}, "appearanceContext")
+      && session.appearanceContext !== undefined
+      ? { appearanceContext: session.appearanceContext }
+      : {}),
     assistantLastOutput: (session && typeof session.assistantLastOutput === "string")
       ? session.assistantLastOutput
       : null,
@@ -707,6 +715,7 @@ function sessionSnapshotSignature(snapshot) {
       codexOriginator: entry.codexOriginator,
       codexSource: entry.codexSource,
       contextUsage: entry.contextUsage,
+      appearanceContext: entry.appearanceContext,
       assistantLastOutput: entry.assistantLastOutput,
       assistantLastOutputTruncated: !!entry.assistantLastOutputTruncated,
       lastEventLabelKey: entry.lastEvent ? entry.lastEvent.labelKey : null,

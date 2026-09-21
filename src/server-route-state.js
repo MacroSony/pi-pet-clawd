@@ -42,6 +42,7 @@ const { CODEX_QUOTA_FIELDS } = require("../hooks/codex-rate-limits");
 const { extractPermissionToolInput } = require("../hooks/kimi-hook");
 const { normalizeCodexUserInputWire } = require("../hooks/codex-user-input");
 const { sanitizeShadowRecord } = require("./windows-process-chain-shadow-log");
+const { parseAppearanceContext } = require("./appearance-context");
 
 // /state POST body size cap. Raised 1024 → 4096 → 16384: a CJK
 // assistant_last_output (3 UTF-8 bytes/char) on a Stop completion blew past
@@ -362,6 +363,15 @@ function handleStatePost(req, res, options) {
       const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
       const sessionTitle = rawTitle || null;
       const sessionTitleClear = data.session_title_clear === true && !sessionTitle;
+      // Optional Pi Forge cosmetic metadata. Only a Pi hook may carry it; a
+      // malformed value is dropped (undefined) rather than clearing a good
+      // context, while an explicit null is a real clear. Absent leaves the
+      // prior context untouched (undefined).
+      const appearanceFieldPresent = Object.prototype.hasOwnProperty.call(data, "appearance_context");
+      const parsedAppearance = appearanceFieldPresent ? parseAppearanceContext(data.appearance_context) : null;
+      const appearanceContext = agentId === "pi" && appearanceFieldPresent && parsedAppearance.ok
+        ? parsedAppearance.value
+        : undefined;
       const contextUsage = normalizeContextUsage(data.context_usage);
       const antigravityQuota = normalizeAntigravityQuota(data.antigravity_quota);
       const claudeQuota = normalizeClaudeQuota(data.claude_quota);
@@ -643,6 +653,7 @@ function handleStatePost(req, res, options) {
           // it's not Claude statusline data.
           if (sessionTitleClear) metaUpdate.clearSessionTitle = true;
           else if (sessionTitle) metaUpdate.sessionTitle = sessionTitle;
+          if (appearanceContext !== undefined) metaUpdate.appearanceContext = appearanceContext;
           if (Object.keys(metaUpdate).length > 0) {
             metadataAccepted = ctx.updateSessionMetadata(session_id || "default", metaUpdate) === true;
           }
@@ -1003,6 +1014,7 @@ function handleStatePost(req, res, options) {
             displayHint: display_svg,
             sessionTitle,
             ...(sessionTitleClear ? { clearSessionTitle: true } : {}),
+            ...(appearanceContext !== undefined ? { appearanceContext } : {}),
             contextUsage,
             contextUsageOrigin: resolveStateContextUsageOrigin(agentId, contextUsage),
             assistantLastOutput,

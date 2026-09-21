@@ -24,6 +24,18 @@ const INBOX_HTTP_TIMEOUT_MS = 5_000;
 const CHAT_ASSISTANT_MAX_BYTES = 8_192;
 const CHAT_DISALLOWED_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
 
+// Optional Pi Forge cosmetic appearance bus (same-process EventBus). The
+// publisher may attach before or after this consumer; we subscribe first and
+// then request a snapshot so either extension order converges.
+const FORGE_ACTIVE_STATE_CHANNEL = "@zihanw/pi-forge/active-state/v1";
+const FORGE_ACTIVE_STATE_REQUEST_CHANNEL = "@zihanw/pi-forge/active-state/request/v1";
+const FORGE_APPEARANCE_SOURCE = "pi-forge";
+const FORGE_APPEARANCE_SCHEMA_VERSION = "1";
+const FORGE_INSTANCE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const FORGE_SCOPED_KEY_RE = /^(global|project):[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const FORGE_PROJECT_KEY_RE = /^[0-9a-f]{64}$/;
+const FORGE_MAX_RETIRED_INSTANCES = 8;
+
 // Kept in step with hooks/shared-process.js NESTED_TERMINAL_ENV; duplicated
 // rather than imported because this module ships standalone in the Pi extension.
 const NESTED_TERMINAL_ENV = [
@@ -747,6 +759,173 @@ function addToolFields(payload, nativeEvent) {
   if (toolCallId) payload.tool_use_id = toolCallId;
 }
 
+// Normalize a Forge raw session-manager id into the canonical `pi:<id>`
+// namespace this hook uses everywhere else. Returns null when unusable.
+function normalizeForgeSessionId(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 4096 || /[\0\r\n]/.test(trimmed)) return null;
+  if (trimmed === "default" || trimmed === `${PI_AGENT_ID}:default` || trimmed === `${PI_AGENT_ID}:`) {
+    return null;
+  }
+  return trimmed.startsWith(`${PI_AGENT_ID}:`) ? trimmed : `${PI_AGENT_ID}:${trimmed}`;
+}
+
+// The request channel expects the raw Pi session-manager id (no `pi:` prefix).
+function readRawPiSessionId(ctx) {
+  const raw = readSessionId(ctx);
+  if (!raw || raw === "default") return null;
+  return raw.startsWith(`${PI_AGENT_ID}:`) ? raw.slice(PI_AGENT_ID.length + 1) : raw;
+}
+
+function normalizeForgeScopedKey(value, projectKey) {
+  if (value === null) return null;
+  if (typeof value !== "string" || !FORGE_SCOPED_KEY_RE.test(value)) return undefined;
+  // A project-scoped resource cannot be represented without its project key.
+  if (value.startsWith("project:") && projectKey === null) return undefined;
+  return value;
+}
+
+function normalizeForgeProjectKey(value) {
+  if (value === null) return null;
+  return typeof value === "string" && FORGE_PROJECT_KEY_RE.test(value) ? value : undefined;
+}
+
+// Returns the wire context (event minus sessionId, plus source) or null when
+// the snapshot is malformed. Extra keys are dropped; only the allowlisted
+// bounded scalars are ever forwarded to Clawd.
+function normalizeForgeAppearanceEvent(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw.schemaVersion !== FORGE_APPEARANCE_SCHEMA_VERSION) return null;
+  const instanceId = typeof raw.instanceId === "string" && FORGE_INSTANCE_ID_RE.test(raw.instanceId)
+    ? raw.instanceId
+    : undefined;
+  const revision = Number.isSafeInteger(raw.revision) && raw.revision >= 0
+    ? raw.revision
+    : undefined;
+  const projectKey = normalizeForgeProjectKey(raw.projectKey);
+  const stackKey = normalizeForgeScopedKey(raw.stackKey, projectKey);
+  const profileKey = normalizeForgeScopedKey(raw.profileKey, projectKey);
+  if (
+    instanceId === undefined
+    || revision === undefined
+    || stackKey === undefined
+    || profileKey === undefined
+    || projectKey === undefined
+  ) {
+    return null;
+  }
+  return {
+    schemaVersion: FORGE_APPEARANCE_SCHEMA_VERSION,
+    source: FORGE_APPEARANCE_SOURCE,
+    instanceId,
+    revision,
+    stackKey,
+    profileKey,
+    projectKey,
+  };
+}
+
+// Same-process EventBus consumer for the optional Forge active-state channel.
+// Rejects wrong-session, stale/duplicate revisions and retired publisher
+// instances with bounded tracking. Never retries or starts timers: an absent
+// Forge is simply no context.
+function createForgeAppearanceConsumer(options = {}) {
+  const pi = options.pi;
+  const getCanonicalSessionId = typeof options.getCanonicalSessionId === "function"
+    ? options.getCanonicalSessionId
+    : () => null;
+  const getRequestSessionId = typeof options.getRequestSessionId === "function"
+    ? options.getRequestSessionId
+    : () => null;
+  const onAppearance = typeof options.onAppearance === "function" ? options.onAppearance : () => {};
+  const events = pi && pi.events;
+
+  if (!events || typeof events.on !== "function" || typeof events.emit !== "function") {
+    return {
+      dispose() {},
+      requestSnapshot() { return false; },
+      getContext: () => null,
+      isActive: () => false,
+    };
+  }
+
+  let disposed = false;
+  let currentInstanceId = null;
+  let currentRevision = -1;
+  let latest = null;
+  const retiredInstances = [];
+
+  function retireInstance(instanceId) {
+    if (!instanceId) return;
+    retiredInstances.push(instanceId);
+    while (retiredInstances.length > FORGE_MAX_RETIRED_INSTANCES) retiredInstances.shift();
+  }
+
+  function handle(rawEvent) {
+    if (disposed) return;
+    const context = normalizeForgeAppearanceEvent(rawEvent);
+    if (!context) return;
+    const eventSessionId = normalizeForgeSessionId(rawEvent && rawEvent.sessionId);
+    if (!eventSessionId) return;
+    let expectedSessionId = null;
+    try { expectedSessionId = getCanonicalSessionId(); } catch { expectedSessionId = null; }
+    if (!expectedSessionId || eventSessionId !== expectedSessionId) return;
+
+    if (context.instanceId !== currentInstanceId) {
+      if (retiredInstances.includes(context.instanceId)) return;
+      if (currentInstanceId) retireInstance(currentInstanceId);
+      currentInstanceId = context.instanceId;
+      currentRevision = context.revision;
+    } else {
+      if (context.revision <= currentRevision) return;
+      currentRevision = context.revision;
+    }
+
+    latest = context;
+    try { onAppearance(context); } catch {}
+  }
+
+  let unsubscribe = null;
+  try {
+    unsubscribe = events.on(FORGE_ACTIVE_STATE_CHANNEL, handle);
+  } catch {
+    unsubscribe = null;
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    if (typeof unsubscribe === "function") {
+      try { unsubscribe(); } catch {}
+    }
+    unsubscribe = null;
+  }
+
+  function requestSnapshot() {
+    if (disposed) return false;
+    let requestSessionId = null;
+    try { requestSessionId = getRequestSessionId(); } catch { requestSessionId = null; }
+    const request = { schemaVersion: FORGE_APPEARANCE_SCHEMA_VERSION };
+    if (typeof requestSessionId === "string" && requestSessionId) {
+      request.sessionId = requestSessionId;
+    }
+    try {
+      events.emit(FORGE_ACTIVE_STATE_REQUEST_CHANNEL, request);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return {
+    dispose,
+    requestSnapshot,
+    getContext: () => latest,
+    isActive: () => !disposed,
+  };
+}
+
 function buildPayload(options = {}) {
   const ctx = options.ctx || {};
   const metadata = options.metadata || {};
@@ -838,6 +1017,18 @@ function buildPayload(options = {}) {
 
   addToolFields(payload, options.nativeEvent);
   if (options.livenessOnly === true) payload.liveness_only = true;
+
+  // Null is an explicit cosmetic clear; an absent option preserves the prior
+  // context (the consumer only sets this once Forge actually reports one).
+  if (options.appearanceContext === null) {
+    payload.appearance_context = null;
+  } else if (
+    options.appearanceContext
+    && typeof options.appearanceContext === "object"
+    && !Array.isArray(options.appearanceContext)
+  ) {
+    payload.appearance_context = options.appearanceContext;
+  }
 
   if (options.capabilityToken && isValidCapabilityToken(options.capabilityToken)) {
     payload.pet_inbox_capability = {
@@ -1562,6 +1753,10 @@ function attach(pi, deps = {}) {
   let latestCtx = null;
   let lifecycleIdle = true;
   let activeConsumer = null;
+  let activeForgeConsumer = null;
+  // `undefined` = no opinion (ordinary events preserve prior context);
+  // `null` = explicit clear; object = validated Forge context.
+  let appearanceContext;
 
   function send(state, event, nativeEvent, ctx, waitForDelivery = false, sendOptions = {}) {
     let report;
@@ -1571,6 +1766,9 @@ function attach(pi, deps = {}) {
       report = false;
     }
     if (!report) return waitForDelivery ? Promise.resolve(false) : false;
+    const optionsWithAppearance = Object.prototype.hasOwnProperty.call(sendOptions, "appearanceContext")
+      ? sendOptions
+      : (appearanceContext === undefined ? sendOptions : { ...sendOptions, appearanceContext });
     let payload;
     try {
       payload = buildPayloadFn({
@@ -1578,7 +1776,7 @@ function attach(pi, deps = {}) {
         event,
         nativeEvent,
         ctx,
-        ...sendOptions,
+        ...optionsWithAppearance,
         ...(capabilityToken ? { capabilityToken } : {}),
         ...(peerCapabilityToken ? { peerCapabilityToken } : {}),
       });
@@ -1599,7 +1797,16 @@ function attach(pi, deps = {}) {
     const sessionKey = payload && payload.session_id ? payload.session_id : "pi:default";
     const task = () => Promise.resolve(postStateFn(payload));
     if (waitForDelivery) return chainDelivery(deliveryChains, sessionKey, task);
-    task().catch(() => {});
+    // UUID epochs cannot order an unseen, delayed predecessor at the server.
+    // Preserve sender order for appearance-bearing packets, including ordinary
+    // events carrying the snapshot. This is the existing HTTP delivery chain,
+    // not a new agent-turn queue; sessions without this optional field keep
+    // their original immediate path.
+    if (Object.prototype.hasOwnProperty.call(payload, "appearance_context")) {
+      chainDelivery(deliveryChains, sessionKey, task).catch(() => {});
+    } else {
+      task().catch(() => {});
+    }
     return true;
   }
 
@@ -1643,6 +1850,54 @@ function attach(pi, deps = {}) {
     }, heartbeatIntervalMs);
     // A liveness timer must never keep a CLI process alive on its own.
     if (heartbeatTimer && typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+  }
+
+  // A Forge update is cosmetic metadata: send it on the existing metadata-only
+  // channel so Clawd annotates the live session without touching state, tool,
+  // timestamps or waking an offline session.
+  function refreshAppearanceContext(context, ctx) {
+    send(
+      contextIsIdle(ctx) ? "idle" : "working",
+      "SessionUpdate",
+      { type: "session_update" },
+      ctx,
+      false,
+      { metadataOnly: true, appearanceContext: context }
+    );
+  }
+
+  function stopForgeAppearanceConsumer() {
+    if (!activeForgeConsumer) return;
+    try { activeForgeConsumer.dispose(); } catch {}
+    activeForgeConsumer = null;
+  }
+
+  function startForgeAppearanceConsumer(ctx) {
+    stopForgeAppearanceConsumer();
+    activeForgeConsumer = createForgeAppearanceConsumer({
+      pi,
+      getCanonicalSessionId: () => getCanonicalRawSessionId(ctx),
+      getRequestSessionId: () => readRawPiSessionId(ctx),
+      onAppearance: (context) => {
+        appearanceContext = context;
+        refreshAppearanceContext(context, ctx);
+      },
+    });
+    // Subscribe first, then request: covers Forge-already-attached and
+    // Forge-attaches-later. A malformed/absent Forge is a silent no-op.
+    activeForgeConsumer.requestSnapshot();
+    // Startup/reload convergence: if this session already had a binding and
+    // Forge did not answer synchronously, clear it on the next normal event so
+    // an unavailable publisher cannot leave a stale renderer binding forever.
+    // The consumer stays subscribed, so a late publisher event still wins and
+    // no timer or extra endpoint is needed. A brand-new session (undefined)
+    // keeps the plain absent shape.
+    if (activeForgeConsumer.isActive() && activeForgeConsumer.getContext() === null) {
+      // A fresh hook attachment cannot know whether Clawd retained a previous
+      // Forge context for this resumed session. An explicit startup clear is
+      // required even when this attach has never observed Forge itself.
+      appearanceContext = null;
+    }
   }
 
   function startInboxConsumer(ctx) {
@@ -1718,6 +1973,12 @@ function attach(pi, deps = {}) {
         if (tracker && typeof tracker.reset === "function") {
           tracker.reset();
         }
+        // A real session switch must not inherit the previous session's
+        // cosmetic binding; a reload is the same session and keeps it.
+        if (!(nativeEvent && nativeEvent.reason === "reload")) appearanceContext = undefined;
+        let report = false;
+        try { report = shouldReportFn(ctx); } catch { report = false; }
+        if (report) startForgeAppearanceConsumer(ctx);
         startHeartbeat();
         const sendResult = send(state, clawdEvent, nativeEvent, ctx, wait);
         if (sendResult !== false) startInboxConsumer(ctx);
@@ -1738,6 +1999,7 @@ function attach(pi, deps = {}) {
       tracker.reset();
     }
     stopHeartbeat();
+    stopForgeAppearanceConsumer();
     if (activeConsumer) {
       activeConsumer.stop();
       activeConsumer = null;
@@ -1745,6 +2007,9 @@ function attach(pi, deps = {}) {
     // Pi emits session_shutdown for an extension reload as well as for a real
     // logical session replacement/quit. Reload must not retire a live pet.
     if (nativeEvent && nativeEvent.reason === "reload") return false;
+    // Real disposal clears the optional cosmetic context with the same
+    // metadata field; the closing status must not retain a stale Forge link.
+    appearanceContext = null;
     return send("sleeping", "SessionEnd", nativeEvent, ctx, true);
   });
 
@@ -1815,6 +2080,21 @@ function attach(pi, deps = {}) {
     getInboxConsumer: () => activeConsumer,
   };
 
+  // Test/observability seams kept non-enumerable so the public handler surface
+  // stays byte-compatible for existing consumers.
+  Object.defineProperties(result, {
+    getForgeConsumer: {
+      value: () => activeForgeConsumer,
+      enumerable: false,
+      configurable: true,
+    },
+    getAppearanceContext: {
+      value: () => appearanceContext,
+      enumerable: false,
+      configurable: true,
+    },
+  });
+
   Object.defineProperty(result, "getTracker", {
     value: () => tracker,
     enumerable: false,
@@ -1826,6 +2106,8 @@ function attach(pi, deps = {}) {
 
 const api = {
   DEFAULT_EVENT_BINDINGS,
+  FORGE_ACTIVE_STATE_CHANNEL,
+  FORGE_ACTIVE_STATE_REQUEST_CHANNEL,
   PEER_CAPABILITY_SLOT_SYMBOL,
   PEER_CAPABILITY_SLOT: PEER_CAPABILITY_SLOT_SYMBOL,
   PI_AGENT_ID,
@@ -1834,11 +2116,14 @@ const api = {
   attach,
   buildPayload,
   createChatTurnTracker,
+  createForgeAppearanceConsumer,
   createRemoteInboxConsumer,
   createTurnTracker: createChatTurnTracker,
   getCanonicalRawSessionId,
   isInteractiveMode,
   isStartableRawSessionId,
+  normalizeForgeAppearanceEvent,
+  normalizeForgeSessionId,
   parseMode,
   postInboxJson,
   postStateToClawd,

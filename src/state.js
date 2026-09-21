@@ -38,6 +38,7 @@ const {
 const { getAgentIconUrl } = require("./state-agent-icons");
 const { resolveSessionIdentity } = require("./session-key");
 const { normalizeTranscriptPath } = require("./transcript-path");
+const { parseAppearanceContext } = require("./appearance-context");
 const { createAccountQuotaStore } = require("./state-account-quota");
 const { normalizeQuotaGroup } = require("../hooks/quota-bucket");
 const { ANTIGRAVITY_QUOTA_FIELDS } = require("../hooks/antigravity-context-usage");
@@ -1487,7 +1488,14 @@ function updateSessionMetadata(sessionId, opts = {}) {
     ? normalizeTitle(opts.sessionTitle)
     : null;
   const clearSessionTitle = opts.clearSessionTitle === true && !incomingTitle;
-  if (!incomingContextUsage && !incomingTitle && !clearSessionTitle) return false;
+  const hasAppearance = Object.prototype.hasOwnProperty.call(opts, "appearanceContext");
+  const parsedAppearance = hasAppearance ? parseAppearanceContext(opts.appearanceContext) : null;
+  if (
+    !incomingContextUsage
+    && !incomingTitle
+    && !clearSessionTitle
+    && !(hasAppearance && parsedAppearance.ok)
+  ) return false;
   let applied = false;
   if (incomingContextUsage) {
     const resolved = resolveContextUsageUpdate(
@@ -1523,6 +1531,19 @@ function updateSessionMetadata(sessionId, opts = {}) {
   } else if (incomingTitle && incomingTitle !== session.sessionTitle) {
     session.sessionTitle = incomingTitle;
     applied = true;
+  }
+  // Appearance is cosmetic metadata: a statusline-style refresh may only
+  // annotate an existing session. It never touches state, lastToolName,
+  // updatedAt or lifecycle fields, so it cannot wake an offline/closed pet.
+  if (hasAppearance && parsedAppearance.ok) {
+    const update = resolveAppearanceContextUpdate(session, opts.appearanceContext);
+    // Persist the private per-session order even for a duplicate so a stale
+    // revision cannot be replayed later; only a real value change broadcasts.
+    session.appearanceOrder = update.order;
+    if (update.changed) {
+      session.appearanceContext = update.value;
+      applied = true;
+    }
   }
   if (applied) emitSessionSnapshot();
   return true;
@@ -1867,6 +1888,101 @@ function resolveIncomingSessionTitle(existing, agentId, incomingTitle) {
   return normalized || (existing && existing.sessionTitle) || null;
 }
 
+// Appearance is a closed cosmetic allowlist rebuilt at every trust boundary.
+// `undefined` preserves, explicit `null` clears, a valid object replaces and a
+// malformed object is dropped (preserve) rather than persisted. The private
+// order guard is per-session, bounded, and never projected into renderer
+// snapshots; it prevents out-of-order HTTP metadata from reviving a retired
+// publisher or a stale revision after a clear.
+const MAX_RETIRED_APPEARANCE_INSTANCES = 8;
+
+function normalizeAppearanceOrder(order) {
+  const source = order && typeof order === "object" && !Array.isArray(order) ? order : null;
+  const retiredInstances = [];
+  if (source && Array.isArray(source.retiredInstances)) {
+    for (const id of source.retiredInstances) {
+      if (typeof id === "string" && id && !retiredInstances.includes(id)) retiredInstances.push(id);
+    }
+    while (retiredInstances.length > MAX_RETIRED_APPEARANCE_INSTANCES) retiredInstances.shift();
+  }
+  const instanceId = source && typeof source.instanceId === "string" ? source.instanceId : null;
+  const revision = source && Number.isSafeInteger(source.revision) && source.revision >= 0
+    ? source.revision
+    : -1;
+  return { instanceId, revision, retiredInstances };
+}
+
+function getAppearanceOrder(existing) {
+  if (existing && existing.appearanceOrder && typeof existing.appearanceOrder === "object") {
+    return normalizeAppearanceOrder(existing.appearanceOrder);
+  }
+  const current = existing && Object.prototype.hasOwnProperty.call(existing, "appearanceContext")
+    ? existing.appearanceContext
+    : undefined;
+  if (current && typeof current === "object") {
+    return { instanceId: current.instanceId, revision: current.revision, retiredInstances: [] };
+  }
+  return { instanceId: null, revision: -1, retiredInstances: [] };
+}
+
+function resolveAppearanceContextUpdate(existing, incoming) {
+  const current = existing && Object.prototype.hasOwnProperty.call(existing, "appearanceContext")
+    ? existing.appearanceContext
+    : undefined;
+  const order = getAppearanceOrder(existing);
+  if (incoming === undefined) {
+    return { value: current, order, changed: false };
+  }
+  const parsed = parseAppearanceContext(incoming);
+  if (!parsed.ok) {
+    return { value: current, order, changed: false };
+  }
+  const next = parsed.value;
+  if (next === null) {
+    const retiredInstances = order.retiredInstances.slice();
+    if (order.instanceId && !retiredInstances.includes(order.instanceId)) {
+      retiredInstances.push(order.instanceId);
+      while (retiredInstances.length > MAX_RETIRED_APPEARANCE_INSTANCES) retiredInstances.shift();
+    }
+    return {
+      value: null,
+      order: { instanceId: null, revision: -1, retiredInstances },
+      changed: current !== null,
+    };
+  }
+  if (order.retiredInstances.includes(next.instanceId)) {
+    return { value: current, order, changed: false };
+  }
+  const sameValue = JSON.stringify(current || null) === JSON.stringify(next);
+  if (order.instanceId !== null && order.instanceId !== next.instanceId) {
+    const retiredInstances = order.retiredInstances.slice();
+    if (!retiredInstances.includes(order.instanceId)) {
+      retiredInstances.push(order.instanceId);
+      while (retiredInstances.length > MAX_RETIRED_APPEARANCE_INSTANCES) retiredInstances.shift();
+    }
+    return {
+      value: next,
+      order: { instanceId: next.instanceId, revision: next.revision, retiredInstances },
+      changed: !sameValue,
+    };
+  }
+  if (order.instanceId === next.instanceId) {
+    if (next.revision <= order.revision) {
+      return { value: current, order, changed: false };
+    }
+    return {
+      value: next,
+      order: { instanceId: next.instanceId, revision: next.revision, retiredInstances: order.retiredInstances },
+      changed: !sameValue,
+    };
+  }
+  return {
+    value: next,
+    order: { instanceId: next.instanceId, revision: next.revision, retiredInstances: order.retiredInstances },
+    changed: !sameValue,
+  };
+}
+
 function updateSession(sessionId, state, event, opts = {}) {
   const suppliedRecapOccurredAt = opts && opts.recapOccurredAt;
   const recapTimestampTrusted = Number.isSafeInteger(suppliedRecapOccurredAt) && suppliedRecapOccurredAt >= 0;
@@ -1900,6 +2016,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     displayHint = undefined,
     sessionTitle = null,
     clearSessionTitle = false,
+    appearanceContext,
     contextUsage = null,
     contextUsageOrigin = null,
     assistantLastOutput = null,
@@ -2053,6 +2170,9 @@ function updateSession(sessionId, state, event, opts = {}) {
       const permissionContext = resolveContextUsageUpdate(existing, contextUsage, contextUsageOrigin);
       const srcContextUsage = permissionContext.contextUsage;
       const srcContextUsageOrigin = permissionContext.contextUsageOrigin;
+      const appearanceUpdate = resolveAppearanceContextUpdate(existing, appearanceContext);
+      const srcAppearanceContext = appearanceUpdate.value;
+      const srcAppearanceOrder = appearanceUpdate.order;
       // PermissionRequest should flash the pet via setState("notification"),
       // but a brand-new Codex permission session must not persist as
       // notification. Otherwise, if the prompt is resolved remotely and no
@@ -2091,6 +2211,8 @@ function updateSession(sessionId, state, event, opts = {}) {
         codexSource: srcCodexSource,
         ghosttyTerminalId: srcGhosttyTerminalId,
         sessionTitle: srcSessionTitle,
+        ...(srcAppearanceContext !== undefined ? { appearanceContext: srcAppearanceContext } : {}),
+        appearanceOrder: srcAppearanceOrder,
         contextUsage: srcContextUsage,
         contextUsageOrigin: srcContextUsageOrigin,
         recentEvents,
@@ -2187,6 +2309,9 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcSessionTitle = clearSessionTitle === true
     ? null
     : resolveIncomingSessionTitle(existing, srcAgentId, sessionTitle);
+  const appearanceUpdate = resolveAppearanceContextUpdate(existing, appearanceContext);
+  const srcAppearanceContext = appearanceUpdate.value;
+  const srcAppearanceOrder = appearanceUpdate.order;
   const normalizedIncomingContextUsage = normalizeContextUsage(contextUsage);
   const effectiveContextUsageOrigin = normalizeContextUsageOrigin(contextUsageOrigin)
     || (srcAgentId === "claude-code" && normalizedIncomingContextUsage && normalizedIncomingContextUsage.source === "claude"
@@ -2490,7 +2615,11 @@ function updateSession(sessionId, state, event, opts = {}) {
     clearSubagentTracker(subagentTracker);
   }
 
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, orcaPaneKey: srcOrcaPaneKey, agentPid: srcAgentPid, agentId: srcAgentId, profileId: (existing && existing.profileId) || profileId || "local", rawSessionId: (existing && existing.rawSessionId) || rawSessionId || sessionId, sessionAutomationIdentity: srcSessionAutomationIdentity, host: srcHost, wslDistro: srcWslDistro, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, appearanceContext: srcAppearanceContext, appearanceOrder: srcAppearanceOrder, contextUsage: srcContextUsage, contextUsageOrigin: srcContextUsageOrigin, metadataUpdatedAt: srcMetadataUpdatedAt, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, lastToolName: srcToolName, transcriptPath: srcTranscriptPath, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true, claudeBackgroundSubagentHoldAt };
+  // Plain sessions must not gain an own `appearanceContext` property: absent
+  // stays absent, while explicit null is retained so snapshots can emit a real
+  // clear instead of renderer-preserving absence.
+  if (srcAppearanceContext === undefined) delete base.appearanceContext;
   if (preserveCompletionAck) base.requiresCompletionAck = true;
   // #862: every branch below rebuilds the session object from `base`; carry the
   // private identity tracker through without exposing it on snapshot surfaces.
