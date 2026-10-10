@@ -48,6 +48,52 @@ before starting the persistent reverse tunnel; automatic tunnel reconnects do
 not replay the monitor mutation.
 The fallback is not needed when Codex official hooks are working.
 
+### Optional local service forwarding (for Linux TTS)
+
+This is opt-in; existing profiles default to `localForwards: []`. For a normal
+parallel-capable SSH host, fully quit Clawd (including its tray process), back
+up `clawd-prefs.json` in Electron's user-data directory, and add this field to
+**the existing profile** under `remoteSsh.profiles[]`:
+
+```json
+"localForwards": [
+  { "localPort": 8790, "remoteHost": "127.0.0.1", "remotePort": 8790 }
+]
+```
+
+On Windows the standard user-data location is
+`%APPDATA%\clawd-on-desk\clawd-prefs.json` (custom launches may override it).
+Restart Clawd and connect that profile. With TTS listening on Linux loopback
+port 8790, the Windows renderer can use `http://127.0.0.1:8790`. This does not
+configure or start TTS, or change renderer URLs/CORS/CSP. Normal profile edits
+in Settings preserve this JSON field; there is no dedicated editor yet.
+
+Up to four entries are allowed, with unique local ports; both ports must be
+integers from 1 to 65535. `remoteHost` defaults to `127.0.0.1` and may only be
+`127.0.0.1` or `localhost`. The local bind is always `127.0.0.1`; bind-address
+fields and other unknown entry keys are rejected. Settings commands return a
+validation error; malformed persisted profiles are dropped on load, following
+the existing profile normalization policy. Use `[]` or remove the field to
+turn forwarding off. Disconnect/reconnect after changing it.
+
+**Failure isolation:** the required relay keeps `ExitOnForwardFailure=yes`.
+Putting `-L` on that same connection would make a busy local port terminate
+`-R` too. Instead, after the relay becomes Connected, a separate noninteractive
+`ssh -N` child carries `-L 127.0.0.1:8790:127.0.0.1:8790`, disables connection
+multiplexing, and retries independently (5 seconds up to 5 minutes). A failed
+optional listener never changes the relay's status. Disconnect, relay failure,
+and app cleanup stop that child and its retry timer. If one entry fails to
+bind, all optional forwards in that child retry together. A running SSH child
+is not proof the TTS service is reachable. A busy port may belong to another
+local service; do not assume responses from it are TTS.
+
+Single-session / Codespaces transports intentionally do **not** start optional
+forwards: the Settings status shows an unsupported warning, and the relay
+continues normally. Opening a second SSH there would violate the transport's
+single-session safety contract. Cross-profile local-port collisions likewise
+only affect optional forwarding. Local forwards are not part of remote hook
+deployment and do not require redeploying hooks.
+
 ### GitHub Codespaces and single-session transports
 
 Clawd inspects the effective local SSH configuration with `ssh -G` before it

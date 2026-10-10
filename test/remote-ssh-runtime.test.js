@@ -673,7 +673,7 @@ test("serialized Connect uses one persistent SSH for readiness and drains on clo
     }),
     drainTimeoutMs: 1000,
   });
-  const profile = makeSecureProfile({ sshTransportMode: "auto" });
+  const profile = makeSecureProfile({ sshTransportMode: "auto", localForwards: [{ localPort: 8790, remotePort: 8790 }] });
   const admitted = await coordinator.acquireConnection(profile);
   const rt = createRemoteSshRuntime({
     spawn,
@@ -699,6 +699,8 @@ test("serialized Connect uses one persistent SSH for readiness and drains on clo
   tunnel._fakeStdout(`startup banner\r\n${marker[0]}\r\n`);
   await flushAsyncEvents();
   assert.equal(rt.getProfileStatus(profile.id).status, "connected");
+  assert.equal(rt.getProfileStatus(profile.id).localForwards.status, "unsupported");
+  assert.equal(children.length, 1, "optional forwards must not bypass single-session coordination");
 
   const operation = await coordinator.acquireOperation(profile, "deploy");
   const drain = rt.suspendForOperation(profile.id, operation.context);
@@ -2596,4 +2598,63 @@ test("an existing idle runtime state presents coordinator quarantine as failed",
   assert.equal(status.lastErrorReason, "manual_lock_inspection_required");
   assert.equal(events.at(-1).status, "failed");
   rt.cleanup();
+});
+
+test("optional local forward busy port retries independently, survives stale exits, and cleans up", async () => {
+  const children = [];
+  const timers = makeFakeTimers();
+  const rt = createRemoteSshRuntime({
+    getHookServerPort: () => 23333,
+    createProfileIngress: makeSecureIngress,
+    setTimeout: timers.setTimeoutFn, clearTimeout: timers.clearTimeoutFn,
+    spawn: (_cmd, args) => {
+      const child = makeMockChild(); child.args = args; children.push(child); return child;
+    },
+  });
+  const profile = makeSecureProfile({ localForwards: [{ localPort: 8790, remotePort: 8790 }] });
+  try {
+    const relay = await connectSecureProfile(rt, timers, children, profile);
+    const local = children.at(-1);
+    assert.ok(relay.args.includes("-R"));
+    assert.ok(!relay.args.includes("-L"));
+    assert.ok(relay.args.includes("ExitOnForwardFailure=yes"));
+    assert.ok(local.args.includes("-L"));
+    assert.ok(local.args.includes("127.0.0.1:8790:127.0.0.1:8790"));
+    assert.ok(!local.args.includes("-R"));
+    assert.ok(local.args.includes("ControlPath=none"));
+    await exitSsh(local, "bind [127.0.0.1]:8790: Address already in use");
+    assert.equal(rt.getProfileStatus(profile.id).status, "connected");
+    assert.equal(rt.getProfileStatus(profile.id).localForwards.status, "retrying");
+    assert.ok(!relay._killed);
+    timers.flushWhere((t) => t.ms === 5000);
+    const replacement = children.at(-1);
+    assert.notEqual(replacement, local);
+    local.emit("exit", 255, null);
+    assert.equal(rt.getProfileStatus(profile.id).localForwards.status, "starting");
+    rt.disconnect(profile.id);
+    assert.ok(replacement._killed);
+    await flushAsyncEvents();
+    assert.equal(timers.size(), 0);
+  } finally { rt.cleanup(); }
+});
+
+test("optional forwards spawn errors never fail relay and cleanup cancels retry", async () => {
+  const children = [];
+  const timers = makeFakeTimers();
+  const rt = createRemoteSshRuntime({
+    getHookServerPort: () => 23333, createProfileIngress: makeSecureIngress,
+    setTimeout: timers.setTimeoutFn, clearTimeout: timers.clearTimeoutFn,
+    spawn: (_cmd, args) => {
+      if (args.includes("-L")) throw new Error("test failure");
+      const child = makeMockChild(); children.push(child); return child;
+    },
+  });
+  try {
+    await connectSecureProfile(rt, timers, children, makeSecureProfile({
+      localForwards: [{ localPort: 8790, remoteHost: "localhost", remotePort: 8790 }],
+    }));
+    assert.equal(rt.getProfileStatus("p1").localForwards.status, "retrying");
+    rt.cleanup();
+    assert.equal(timers.size(), 0);
+  } finally { rt.cleanup(); }
 });

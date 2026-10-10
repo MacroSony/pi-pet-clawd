@@ -310,6 +310,33 @@ function isValidPort(value) {
   return Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
+// Optional local listeners are always bound to IPv4 loopback by the runtime.
+// Reject unknown keys (including bindHost) rather than silently accepting them.
+function normalizeLocalForwards(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 4) {
+    throw new TypeError("profile.localForwards must be an array with at most 4 entries");
+  }
+  const ports = new Set();
+  return value.map((entry, index) => {
+    const prefix = `profile.localForwards[${index}]`;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || Object.keys(entry).some((key) => !["localPort", "remoteHost", "remotePort"].includes(key))) {
+      throw new TypeError(`${prefix} must contain only localPort, remoteHost, remotePort (local bind is always 127.0.0.1)`);
+    }
+    if (!isValidPort(entry.localPort) || !isValidPort(entry.remotePort)) {
+      throw new TypeError(`${prefix} ports must be integers in [1, 65535]`);
+    }
+    const remoteHost = entry.remoteHost === undefined ? "127.0.0.1" : entry.remoteHost;
+    if (remoteHost !== "127.0.0.1" && remoteHost !== "localhost") {
+      throw new TypeError(`${prefix}.remoteHost must be 127.0.0.1 or localhost`);
+    }
+    if (ports.has(entry.localPort)) throw new TypeError(`${prefix}.localPort must be unique`);
+    ports.add(entry.localPort);
+    return { localPort: entry.localPort, remoteHost, remotePort: entry.remotePort };
+  });
+}
+
 function isValidRemoteForwardPort(value) {
   return REMOTE_FORWARD_PORTS.includes(value);
 }
@@ -487,6 +514,11 @@ function validateProfile(profile) {
       message: `profile.remoteForwardPort must be one of ${REMOTE_FORWARD_PORTS.join(", ")}`,
     };
   }
+  try {
+    normalizeLocalForwards(profile.localForwards);
+  } catch (err) {
+    return { status: "error", message: err.message };
+  }
   const runtimeMode = profile.runtimeMode || REMOTE_RUNTIME_MODE_ACCOUNT_DEFAULT;
   const runtimeKey = profile.runtimeKey || ACCOUNT_DEFAULT_RUNTIME_KEY;
   if (!isValidRuntimeMode(runtimeMode)) {
@@ -627,7 +659,9 @@ function validateProfile(profile) {
 function sanitizeProfile(raw) {
   if (!raw || typeof raw !== "object") return null;
   let runtimeIdentity;
+  let localForwards;
   try {
+    localForwards = normalizeLocalForwards(raw.localForwards);
     runtimeIdentity = normalizeRemoteRuntimeIdentity({
       runtimeMode: raw.runtimeMode,
       runtimeKey: raw.runtimeKey,
@@ -644,6 +678,7 @@ function sanitizeProfile(raw) {
       ? raw.identityFile
       : undefined,
     remoteForwardPort: Number.isInteger(raw.remoteForwardPort) ? raw.remoteForwardPort : 23333,
+    localForwards,
     runtimeMode: runtimeIdentity.runtimeMode,
     runtimeKey: runtimeIdentity.runtimeKey,
     layoutVersion: REMOTE_LAYOUT_VERSION,
@@ -848,6 +883,7 @@ module.exports = {
   sanitizeSshTransportHint,
   isValidHost,
   isValidPort,
+  normalizeLocalForwards,
   isValidRemoteForwardPort,
   isValidIdentityFile,
   isValidHostPrefix,
