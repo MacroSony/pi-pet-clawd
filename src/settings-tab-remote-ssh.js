@@ -469,6 +469,12 @@
       statusRow.appendChild(msg);
     }
     section.appendChild(statusRow);
+    if (status.localForwards && status.localForwards.message) {
+      const warning = document.createElement("div");
+      warning.className = "remote-ssh-status-message";
+      warning.textContent = status.localForwards.message;
+      section.appendChild(warning);
+    }
 
     // Hooks deployment row — independent of tunnel status. Connect alone does
     // not push hooks; users need to see clearly whether hooks ever made it
@@ -923,6 +929,8 @@
         label: (formData.label || "").trim(),
         host: (formData.host || "").trim(),
         remoteForwardPort: formData.remoteForwardPort,
+        // Preserve JSON-configured optional forwards across ordinary UI edits.
+        localForwards: formData.localForwards || [],
         sshTransportMode: formData.sshTransportMode === "serialized" ? "serialized" : "auto",
         autoStartCodexMonitor: !!formData.autoStartCodexMonitor,
         chainStatusline: !!formData.chainStatusline,

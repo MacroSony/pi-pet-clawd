@@ -46,6 +46,9 @@ const { resolveRemoteRuntimeLayout } = require("./remote-ssh-layout");
 const { redactTransportDiagnostic } = require("./remote-ssh-transport");
 const { appendRemoteSshConfigArgs } = require("./remote-ssh-local-config");
 
+const { normalizeLocalForwards } = require("./remote-ssh-profile");
+const { createLocalForwarder } = require("./remote-ssh-local-forwards");
+
 const SSH_BASE_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"];
 const SCP_BASE_OPTS = ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"];
 // Interactive base intentionally empty: no -T (pty needed), no BatchMode=yes
@@ -474,6 +477,8 @@ function createRemoteSshRuntime(deps = {}) {
       hint: null,
       lastError: null,
       lastErrorReason: null,
+      localForwarder: null,
+      localForwardStatus: null,
       sshChild: null,
       ingress: null,
       ingressStartGeneration: 0,
@@ -526,11 +531,53 @@ function createRemoteSshRuntime(deps = {}) {
 
   function setStatus(state, status, extra = {}) {
     state.status = status;
+    if (status !== "connected") stopLocalForwards(state);
+    else startLocalForwards(state);
     if ("message" in extra) state.message = extra.message;
     if ("hint" in extra) state.hint = extra.hint;
     if ("lastError" in extra) state.lastError = extra.lastError;
     if ("lastErrorReason" in extra) state.lastErrorReason = extra.lastErrorReason;
     emitStatus(state);
+  }
+
+  function stopLocalForwards(state) {
+    const forwarder = state.localForwarder;
+    state.localForwarder = null;
+    if (forwarder) forwarder.stop();
+    state.localForwardStatus = null;
+  }
+
+  function startLocalForwards(state) {
+    if (state.localForwarder || !(state.profile.localForwards || []).length) return;
+    // Single-session ProxyCommand transports cannot safely admit a second SSH.
+    // Do not degrade or bypass their coordinator just to provide optional TTS.
+    if (state.serializedTransport) {
+      state.localForwardStatus = { status: "unsupported", message: "Optional local forwards require a parallel-capable SSH transport" };
+      return;
+    }
+    let forwards;
+    try { forwards = normalizeLocalForwards(state.profile.localForwards); }
+    catch (err) {
+      state.localForwardStatus = { status: "failed", message: err.message };
+      return;
+    }
+    const profile = { ...state.profile }; // Immutable destination for this relay lifetime.
+    const forwarder = createLocalForwarder({
+      spawn, setTimeout: setTimeoutFn, clearTimeout: clearTimeoutFn,
+      buildArgs: () => buildSshArgs(profile, { extraOpts: [
+        "-N", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ControlMaster=no", "-o", "ControlPath=none",
+        "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+        ...forwards.flatMap((f) => ["-L", `127.0.0.1:${f.localPort}:${f.remoteHost}:${f.remotePort}`]),
+      ] }),
+      onStatus: (value) => {
+        if (state.localForwarder !== forwarder) return;
+        state.localForwardStatus = value;
+        emitStatus(state);
+      },
+    });
+    state.localForwarder = forwarder;
+    forwarder.start();
   }
 
   function emitStatus(state) {
@@ -559,6 +606,7 @@ function createRemoteSshRuntime(deps = {}) {
       lastErrorReason: transportFailed
         ? (transportFailureReason || "transport_drain_timeout")
         : state.lastErrorReason,
+      ...(state.localForwardStatus ? { localForwards: state.localForwardStatus } : {}),
       retryAttempt: state.retryAttempt,
       forwardRecoveryFailures: state.forwardRecoveryFailures,
       ...(transport ? transport : {}),
@@ -2129,6 +2177,7 @@ function createRemoteSshRuntime(deps = {}) {
     unsubscribeCoordinatorStatus();
     for (const state of states.values()) {
       state.stopped = true;
+      stopLocalForwards(state);
       cleanupProbeLoop(state);
       if (state.backoffTimer) clearTimeoutFn(state.backoffTimer);
       state.backoffTimer = null;

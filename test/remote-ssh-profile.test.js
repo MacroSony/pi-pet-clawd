@@ -1474,3 +1474,30 @@ test("real controller: delete + markDeployed serialize (no resurrected profile)"
     try { fs.unlinkSync(tmp); } catch {}
   }
 });
+
+test("optional local forwards default empty and normalize loopback host", () => {
+  assert.deepEqual(sanitizeProfile(basicProfile()).localForwards, []);
+  const profile = basicProfile({ localForwards: [{ localPort: 8790, remotePort: 8790 }] });
+  const expected = [{ localPort: 8790, remoteHost: "127.0.0.1", remotePort: 8790 }];
+  assert.equal(validateProfile(profile).status, "ok");
+  assert.deepEqual(sanitizeProfile(profile).localForwards, expected);
+  assert.deepEqual(normalizeRemoteSsh({ profiles: [profile] }).profiles[0].localForwards, expected);
+  assert.equal(validateProfile(basicProfile({ localForwards: [{ localPort: 1, remoteHost: "localhost", remotePort: 65535 }] })).status, "ok");
+});
+
+test("local forwards reject malformed, non-loopback, duplicate and excess entries", () => {
+  const entry = { localPort: 8790, remotePort: 8790 };
+  const invalid = [null, {}, "8790", [null], ["8790"],
+    [{ ...entry, localPort: "8790" }], [{ ...entry, remotePort: 1.5 }],
+    [{ ...entry, localPort: 0 }], [{ ...entry, remotePort: 65536 }],
+    [{ ...entry, localPort: NaN }], [{ ...entry, remotePort: -1 }],
+    [{ ...entry, remoteHost: "0.0.0.0" }], [{ ...entry, remoteHost: "::1" }],
+    [{ ...entry, remoteHost: "localhost:22" }], [{ ...entry, remoteHost: null }],
+    [{ ...entry, bindHost: "0.0.0.0" }], [entry, entry],
+    Array.from({ length: 5 }, (_, i) => ({ ...entry, localPort: 8790 + i }))];
+  for (const localForwards of invalid) {
+    const profile = basicProfile({ localForwards });
+    assert.match(validateProfile(profile).message, /localForwards/);
+    assert.equal(sanitizeProfile(profile), null);
+  }
+});
